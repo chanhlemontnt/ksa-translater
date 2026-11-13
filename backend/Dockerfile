@@ -8,10 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install minimal native dependencies required by lxml / cryptography
+# Install minimal native dependencies required by lxml / cryptography / pdf2image (poppler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2 \
     libxslt1.1 \
+    poppler-utils \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

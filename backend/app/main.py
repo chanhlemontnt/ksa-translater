@@ -32,6 +32,7 @@ from app.key_rotator import get_project_rotator
 from app.legal_review import LegalReviewResult, get_legal_review_service
 from app.translation_service import (
     MIME_DOCX,
+    MIME_PDF,
     MIME_XLSX,
     SUPPORTED_LANG_PAIRS,
     SYNC_MAX_CHARS,
@@ -73,8 +74,10 @@ app.add_middleware(
 def _safe_output_filename(original_name: str, source_lang: str, target_lang: str, layout_mode: str) -> str:
     stem = Path(original_name).stem or "contract"
     ext = Path(original_name).suffix.lower() or ".docx"
+    # PDF inputs are OCR-extracted and assembled into bilingual .docx outputs
+    out_ext = ".docx" if ext == ".pdf" else ext
     clean_stem = "".join(ch if ch.isalnum() or ch in ("-", "_", ".", " ") else "_" for ch in stem).strip()
-    return f"{clean_stem}_{source_lang}-{target_lang}_{layout_mode}{ext}"
+    return f"{clean_stem}_{source_lang}-{target_lang}_{layout_mode}{out_ext}"
 
 
 @app.get("/healthz")
@@ -134,7 +137,7 @@ async def get_app_config(
 @app.post("/api/translate")
 async def translate_contract(
     request: Request,
-    file: UploadFile = File(..., description="Hợp đồng .docx hoặc bảng biểu .xlsx"),
+    file: UploadFile = File(..., description="Hợp đồng .docx, .pdf hoặc bảng biểu .xlsx"),
     source_lang: str = Form(..., description="Mã ngôn ngữ nguồn: vi | en | ko"),
     target_lang: str = Form(..., description="Mã ngôn ngữ đích: ko | vi | en"),
     layout_mode: Literal["side_by_side", "alternating", "replace_column"] = Form("side_by_side"),
@@ -162,10 +165,10 @@ async def translate_contract(
 
     raw_filename = file.filename or "contract.docx"
     ext = Path(raw_filename).suffix.lower()
-    if ext not in (".docx", ".xlsx"):
+    if ext not in (".docx", ".xlsx", ".pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Chỉ hỗ trợ định dạng hợp đồng Word (.docx) hoặc Excel (.xlsx).",
+            detail="Chỉ hỗ trợ định dạng hợp đồng Word (.docx), Excel (.xlsx) hoặc PDF (.pdf).",
         )
 
     file_bytes = await file.read()
@@ -180,8 +183,20 @@ async def translate_contract(
     job_id = str(uuid.uuid4())
     started_at = time.time()
 
-    # 1. Extract character & page metrics to decide Sync vs Async
-    metrics = translation_svc.inspect_document(file_bytes=file_bytes, filename=raw_filename)
+    # 1. Extract character & page metrics (with Auto-Detect PDF / Vision OCR if .pdf)
+    if ext == ".pdf":
+        working_bytes, metrics, _ = translation_svc.prepare_pdf_for_translation(
+            file_bytes=file_bytes,
+            filename=raw_filename,
+        )
+        working_ext = ".docx"
+        orig_mime = MIME_PDF
+    else:
+        working_bytes = file_bytes
+        working_ext = ext
+        metrics = translation_svc.inspect_document(file_bytes=file_bytes, filename=raw_filename)
+        orig_mime = metrics.mime_type
+
     output_filename = _safe_output_filename(raw_filename, src, tgt, layout_mode)
 
     # Log sanitized request metadata via DLP (never log raw filename/email PII unredacted)
@@ -199,6 +214,8 @@ async def translate_contract(
             "char_count": metrics.char_count,
             "estimated_pages": metrics.estimated_pages,
             "requires_async": metrics.requires_async,
+            "pdf_type": metrics.pdf_type,
+            "ocr_vision_requests": metrics.ocr_vision_requests,
             "timestamp": int(started_at),
         }
     )
@@ -211,14 +228,23 @@ async def translate_contract(
         stage="original",
         filename=raw_filename,
         content=file_bytes,
-        mime_type=metrics.mime_type,
+        mime_type=orig_mime,
     )
+    layout_source_ref = orig_ref
+    if ext == ".pdf":
+        layout_source_ref = translation_svc.store_session_artifact(
+            session_id=job_id,
+            stage="prepared",
+            filename=f"{Path(raw_filename).stem}.docx",
+            content=working_bytes,
+            mime_type=MIME_DOCX,
+        )
 
     # 2A. ASYNC FLOW (> 15 pages OR > 20,000 chars)
     if metrics.requires_async:
         batch_meta = translation_svc.start_batch_async(
             session_id=job_id,
-            file_bytes=file_bytes,
+            file_bytes=working_bytes,
             metrics=metrics,
             source_lang=src,
             target_lang=tgt,
@@ -236,11 +262,11 @@ async def translate_contract(
             "use_glossary": use_glossary,
             "enable_legal_review": enable_legal_review,
             "replace_col_index": replace_col_index,
-            "extension": ext,
+            "extension": working_ext,
             "mime_type": metrics.mime_type,
             "output_filename": output_filename,
             "metrics": metrics.model_dump(),
-            "original_ref": orig_ref,
+            "original_ref": layout_source_ref,
             "batch_meta": batch_meta,
             "project_id": batch_meta.get("project_id"),
         }
@@ -264,7 +290,7 @@ async def translate_contract(
     # 2B. SYNC FLOW (<= 15 pages AND <= 20,000 chars)
     translated_raw_bytes, project_used = translation_svc.translate_sync(
         session_id=job_id,
-        file_bytes=file_bytes,
+        file_bytes=working_bytes,
         metrics=metrics,
         source_lang=src,
         target_lang=tgt,
@@ -273,9 +299,9 @@ async def translate_contract(
 
     # 3. Build Bilingual Layout (.docx / .xlsx)
     final_bytes = build_bilingual_document(
-        original_bytes=file_bytes,
+        original_bytes=working_bytes,
         translated_bytes=translated_raw_bytes,
-        extension=ext,
+        extension=working_ext,
         layout_mode=layout_mode,
         source_lang=src,
         target_lang=tgt,
@@ -286,10 +312,10 @@ async def translate_contract(
     legal_result: Optional[LegalReviewResult] = None
     if enable_legal_review:
         final_bytes, legal_result = await legal_svc.review_and_annotate(
-            original_bytes=file_bytes,
+            original_bytes=working_bytes,
             translated_bytes=translated_raw_bytes,
             merged_bilingual_bytes=final_bytes,
-            extension=ext,
+            extension=working_ext,
             source_lang=src,
             target_lang=tgt,
         )

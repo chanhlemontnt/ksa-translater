@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 DEFAULT_MONTHLY_SOFT_LIMIT = int(os.getenv("GCP_PROJECT_MONTHLY_CHAR_LIMIT", "480000"))
+DEFAULT_VISION_MONTHLY_LIMIT = int(os.getenv("GCP_VISION_MONTHLY_LIMIT", "950"))
 DEFAULT_LOCATION = os.getenv("GCP_TRANSLATE_LOCATION", "us-central1")
 
 # Canonical glossary IDs per bidirectional language pair if not explicitly overridden per project
@@ -55,6 +56,13 @@ class ProjectEntry(BaseModel):
     usage_month: str = Field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m"))
     cooldown_until: float = 0.0
     enabled: bool = True
+    # Google Cloud Vision API quota tracking (Always Free: 1,000 requests/month per project)
+    vision_monthly_limit: int = DEFAULT_VISION_MONTHLY_LIMIT
+    vision_used_requests: int = 0
+    vision_usage_month: str = Field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m"))
+    vision_cooldown_until: float = 0.0
+    vision_enabled: bool = True
+    vision_credentials_file: Optional[str] = None
 
 
 class ProjectPoolRotator:
@@ -64,6 +72,8 @@ class ProjectPoolRotator:
         self._lock = threading.Lock()
         self._projects: list[ProjectEntry] = projects if projects is not None else self._load_from_env()
         self._cursor: int = 0
+        self._vision_cursor: int = 0
+        self._vision_clients: dict[str, Any] = {}
 
     @staticmethod
     def _current_utc_month() -> str:
@@ -116,6 +126,10 @@ class ProjectPoolRotator:
             entry.usage_month = curr_month
             entry.used_chars = 0
             entry.cooldown_until = 0.0
+        if entry.vision_usage_month != curr_month:
+            entry.vision_usage_month = curr_month
+            entry.vision_used_requests = 0
+            entry.vision_cooldown_until = 0.0
 
     def select_project(self, estimated_chars: int = 0) -> ProjectEntry:
         """Selects the next healthy GCP project with sufficient monthly quota buffer."""
@@ -206,6 +220,102 @@ class ProjectPoolRotator:
 
         return None
 
+    # ------------------------------------------------------------------
+    # Google Cloud Vision API Client Rotation (1,000 req/month free/project)
+    # ------------------------------------------------------------------
+
+    def select_vision_project(self, estimated_requests: int = 1) -> ProjectEntry:
+        """Selects the next healthy GCP project with available Vision API monthly free quota."""
+        with self._lock:
+            if not self._projects:
+                raise RuntimeError(
+                    "GCP project pool is empty. Configure GCP_PROJECT_POOL_JSON or GCP_PROJECT_ID."
+                )
+
+            now = time.time()
+            n = len(self._projects)
+
+            # Pass 1: Active, Vision-enabled, not in cooldown, within soft monthly request limit
+            for offset in range(n):
+                idx = (self._vision_cursor + offset) % n
+                candidate = self._projects[idx]
+                self._reset_month_if_needed(candidate)
+                if (
+                    not candidate.enabled
+                    or not candidate.vision_enabled
+                    or candidate.vision_cooldown_until > now
+                ):
+                    continue
+                if candidate.vision_used_requests + estimated_requests <= candidate.vision_monthly_limit:
+                    self._vision_cursor = (idx + 1) % n
+                    return candidate.model_copy(deep=True)
+
+            # Pass 2: Active, Vision-enabled, not in cooldown (overflow past soft limit)
+            for offset in range(n):
+                idx = (self._vision_cursor + offset) % n
+                candidate = self._projects[idx]
+                if candidate.enabled and candidate.vision_enabled and candidate.vision_cooldown_until <= now:
+                    logger.warning(
+                        "All projects reached Vision soft monthly limit; selecting %s as overflow.",
+                        candidate.project_id,
+                    )
+                    self._vision_cursor = (idx + 1) % n
+                    return candidate.model_copy(deep=True)
+
+            # Pass 3: Earliest Vision cooldown expiry as last resort
+            active_projects = [p for p in self._projects if p.enabled and p.vision_enabled]
+            if not active_projects:
+                raise RuntimeError("All configured GCP projects have Vision API disabled.")
+            earliest = min(active_projects, key=lambda p: p.vision_cooldown_until)
+            return earliest.model_copy(deep=True)
+
+    def get_vision_client(self, estimated_requests: int = 1) -> tuple[Any, ProjectEntry]:
+        """Allocates a Cloud Vision ImageAnnotatorClient bound to the rotated GCP project."""
+        from google.api_core.client_options import ClientOptions
+        from google.cloud import vision
+
+        project = self.select_vision_project(estimated_requests=estimated_requests)
+        with self._lock:
+            cached = self._vision_clients.get(project.project_id)
+            if cached is not None:
+                return cached, project
+
+            client_options = ClientOptions(quota_project_id=project.project_id)
+            if project.vision_credentials_file and Path(project.vision_credentials_file).exists():
+                from google.oauth2 import service_account
+
+                creds = service_account.Credentials.from_service_account_file(
+                    project.vision_credentials_file
+                )
+                client = vision.ImageAnnotatorClient(
+                    credentials=creds,
+                    client_options=client_options,
+                )
+            else:
+                client = vision.ImageAnnotatorClient(client_options=client_options)
+
+            self._vision_clients[project.project_id] = client
+            return client, project
+
+    def record_vision_usage(self, project_id: str, requests_count: int = 1) -> None:
+        """Increments in-memory monthly Vision API request counter for a GCP project."""
+        if requests_count <= 0:
+            return
+        with self._lock:
+            for entry in self._projects:
+                if entry.project_id == project_id:
+                    self._reset_month_if_needed(entry)
+                    entry.vision_used_requests += requests_count
+                    break
+
+    def mark_vision_exhausted(self, project_id: str, cooldown_seconds: int = 3600) -> None:
+        """Places a project's Vision API into temporary cooldown upon HTTP 429 ResourceExhausted."""
+        with self._lock:
+            for entry in self._projects:
+                if entry.project_id == project_id:
+                    entry.vision_cooldown_until = time.time() + cooldown_seconds
+                    break
+
     def get_pool_summary(self) -> list[dict[str, Any]]:
         """Returns non-sensitive pool telemetry (never exposes secrets)."""
         now = time.time()
@@ -222,6 +332,11 @@ class ProjectPoolRotator:
                         "used_chars": entry.used_chars,
                         "monthly_char_limit": entry.monthly_char_limit,
                         "usage_month": entry.usage_month,
+                        "vision_enabled": entry.vision_enabled,
+                        "vision_in_cooldown": entry.vision_cooldown_until > now,
+                        "vision_used_requests": entry.vision_used_requests,
+                        "vision_monthly_limit": entry.vision_monthly_limit,
+                        "vision_usage_month": entry.vision_usage_month,
                     }
                 )
             return summary

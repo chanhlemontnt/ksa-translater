@@ -86,6 +86,28 @@
     }
     .dropzone input[type='file'] { display: none; }
     .dropzone-icon { font-size: 2.2rem; margin-bottom: 8px; }
+    .format-badges {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .format-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: #334155;
+    }
+    .format-badge.pdf { border-color: #fecaca; background: #fef2f2; color: #b91c1c; }
+    .format-badge.docx { border-color: #bfdbfe; background: #eff6ff; color: #1d4ed8; }
+    .format-badge.xlsx { border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }
     .file-pill {
       display: inline-flex;
       align-items: center;
@@ -200,7 +222,7 @@
     <div class="header-inner">
       <div class="brand">
         <h1>⚖️ Dịch Hợp Đồng Song Ngữ Tự Động (Việt • Hàn • Anh)</h1>
-        <p>Cloud Translation v3 Advanced • Giữ nguyên định dạng .docx/.xlsx • AI Legal Review</p>
+        <p>Cloud Translation v3 Advanced • Hỗ trợ .docx / .xlsx / .pdf (OCR Vision) • AI Legal Review</p>
       </div>
       <div class="badge-zero" id="authBadge">🔒 Zero Trust Protected</div>
     </div>
@@ -210,12 +232,17 @@
     <form id="translateForm">
       <!-- Step 1: File Upload -->
       <div class="card">
-        <div class="section-title">1. Tải lên Hợp đồng (.docx) hoặc Phụ lục bảng biểu (.xlsx)</div>
+        <div class="section-title">1. Tải lên Hợp đồng (.docx, .pdf) hoặc Phụ lục bảng biểu (.xlsx)</div>
         <div class="dropzone" id="dropzone">
-          <div class="dropzone-icon">📄</div>
+          <div class="dropzone-icon">📘 📗 📕</div>
           <div><strong>Kéo thả file hợp đồng vào đây</strong> hoặc nhấn để chọn từ máy tính</div>
-          <div class="meta-note">Hỗ trợ: Word (.docx), Excel (.xlsx) • Tối đa 25MB • Tự động xoá trên Cloud sau 7 ngày</div>
-          <input type="file" id="fileInput" accept=".docx,.xlsx" />
+          <div class="format-badges">
+            <span class="format-badge docx">📘 Word (.docx)</span>
+            <span class="format-badge xlsx">📗 Excel (.xlsx)</span>
+            <span class="format-badge pdf">📕 PDF (.pdf • Auto OCR)</span>
+          </div>
+          <div class="meta-note">Tối đa 25MB • PDF scan tự động OCR bằng Google Cloud Vision • Tự động xoá trên Cloud sau 7 ngày</div>
+          <input type="file" id="fileInput" accept=".docx,.xlsx,.pdf" />
           <div id="selectedFilePill" class="file-pill hidden"></div>
         </div>
       </div>

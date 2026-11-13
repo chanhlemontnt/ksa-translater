@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from app.dlp_service import get_dlp_service
 from app.key_rotator import ProjectEntry, get_project_rotator
+from app.vision_ocr_service import PdfExtractionResult, get_vision_ocr_service
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ SYNC_MAX_CHARS = int(os.getenv("SYNC_MAX_CHARS", "20000"))
 
 MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+MIME_PDF = "application/pdf"
 
 SUPPORTED_LANG_PAIRS: set[tuple[str, str]] = {
     ("vi", "ko"),
@@ -59,6 +61,8 @@ class DocumentMetrics(BaseModel):
     char_count: int
     estimated_pages: int
     requires_async: bool
+    pdf_type: Optional[str] = None
+    ocr_vision_requests: int = 0
 
 
 class TranslationService:
@@ -107,6 +111,33 @@ class TranslationService:
             estimated_pages=max(1, est_pages),
             requires_async=requires_async,
         )
+
+    def prepare_pdf_for_translation(
+        self,
+        file_bytes: bytes,
+        filename: str,
+    ) -> tuple[bytes, DocumentMetrics, PdfExtractionResult]:
+        """Runs Auto-Detect PDF extraction / Vision OCR and converts blocks to .docx bytes."""
+        ocr_service = get_vision_ocr_service()
+        extraction = ocr_service.extract_pdf(file_bytes=file_bytes, filename=filename)
+        docx_bytes = extraction.to_docx_bytes()
+
+        est_pages = max(1, extraction.page_count)
+        char_count = extraction.char_count
+        requires_async = (est_pages > SYNC_MAX_PAGES) or (char_count > SYNC_MAX_CHARS)
+
+        metrics = DocumentMetrics(
+            filename=filename,
+            extension=".docx",
+            mime_type=MIME_DOCX,
+            size_bytes=len(file_bytes),
+            char_count=char_count,
+            estimated_pages=est_pages,
+            requires_async=requires_async,
+            pdf_type=extraction.pdf_type,
+            ocr_vision_requests=extraction.vision_requests_used,
+        )
+        return docx_bytes, metrics, extraction
 
     def _inspect_docx(self, file_bytes: bytes) -> tuple[int, int]:
         doc = docx.Document(io.BytesIO(file_bytes))

@@ -45,8 +45,8 @@
   function setFile(file) {
     if (!file) return;
     const lower = file.name.toLowerCase();
-    if (!lower.endsWith('.docx') && !lower.endsWith('.xlsx')) {
-      alert('Vui lòng chỉ chọn file hợp đồng Word (.docx) hoặc Excel (.xlsx).');
+    if (!lower.endsWith('.docx') && !lower.endsWith('.xlsx') && !lower.endsWith('.pdf')) {
+      alert('Vui lòng chỉ chọn file hợp đồng Word (.docx), Excel (.xlsx) hoặc PDF (.pdf).');
       return;
     }
     if (file.size > 25 * 1024 * 1024) {
@@ -55,7 +55,8 @@
     }
     currentFile = file;
     const kb = (file.size / 1024).toFixed(1);
-    selectedFilePill.textContent = `📎 ${file.name} (${kb} KB)`;
+    const icon = lower.endsWith('.pdf') ? '📕' : lower.endsWith('.xlsx') ? '📗' : '📘';
+    selectedFilePill.textContent = `${icon} ${file.name} (${kb} KB)`;
     selectedFilePill.classList.remove('hidden');
   }
 
@@ -98,7 +99,13 @@
     statusDesc.textContent = `Chế độ xử lý: ${data.mode === 'async' ? 'Batch Async (Hợp đồng lớn)' : 'Đồng bộ tốc độ cao (Sync)'}. File tải về giữ nguyên 100% dữ liệu gốc.`;
 
     if (data.metrics) {
-      metricsInfo.textContent = `📊 Thống kê: ~${data.metrics.estimated_pages} trang • ${Number(data.metrics.char_count || 0).toLocaleString('vi-VN')} ký tự trích xuất`;
+      let pdfNote = '';
+      if (data.metrics.pdf_type === 'text_pdf') {
+        pdfNote = ' • Text PDF (0 quota OCR)';
+      } else if (data.metrics.pdf_type === 'scanned_pdf') {
+        pdfNote = ` • Scanned PDF (Vision OCR: ${data.metrics.ocr_vision_requests || 0} trang)`;
+      }
+      metricsInfo.textContent = `📊 Thống kê: ~${data.metrics.estimated_pages} trang • ${Number(data.metrics.char_count || 0).toLocaleString('vi-VN')} ký tự trích xuất${pdfNote}`;
     }
 
     if (data.download_url) {
@@ -168,7 +175,7 @@
   translateForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!currentFile) {
-      alert('Vui lòng chọn file hợp đồng (.docx hoặc .xlsx) trước khi dịch.');
+      alert('Vui lòng chọn file hợp đồng (.docx, .xlsx hoặc .pdf) trước khi dịch.');
       return;
     }
     if (pollTimer) {
