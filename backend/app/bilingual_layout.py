@@ -252,14 +252,12 @@ def _docx_side_by_side(
             if isinstance(o_obj, Paragraph):
                 _copy_runs_with_basic_style(o_obj, left_p)
             elif o_obj is not None:
-                left_p.add_run("
-".join(_flatten_table_text(o_obj)))
+                left_p.add_run("\n".join(_flatten_table_text(o_obj)))
 
             if isinstance(t_obj, Paragraph):
                 _copy_runs_with_basic_style(t_obj, right_p)
             elif t_obj is not None:
-                right_p.add_run("
-".join(_flatten_table_text(t_obj)))
+                right_p.add_run("\n".join(_flatten_table_text(t_obj)))
 
         elif o_kind == "tbl" or t_kind == "tbl":
             o_lines = _flatten_table_text(o_obj) if o_obj is not None else []
