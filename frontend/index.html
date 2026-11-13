@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dịch Hợp Đồng Song Ngữ (Việt • Hàn • Anh) — dich.tnt.name.vn</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --primary: #0f172a;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --text: #1e293b;
+      --muted: #64748b;
+      --success: #059669;
+      --warn: #d97706;
+      --danger: #dc2626;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+      padding-bottom: 60px;
+    }
+    header {
+      background: var(--primary);
+      color: #fff;
+      padding: 20px 24px;
+      border-bottom: 3px solid var(--accent);
+    }
+    .header-inner {
+      max-width: 980px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .brand h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
+    .brand p { font-size: 0.85rem; color: #94a3b8; margin-top: 2px; }
+    .badge-zero {
+      background: rgba(37, 99, 235, 0.25);
+      border: 1px solid #3b82f6;
+      color: #bfdbfe;
+      font-size: 0.78rem;
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    main { max-width: 980px; margin: 28px auto; padding: 0 20px; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+      margin-bottom: 20px;
+    }
+    .section-title {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: 14px;
+      color: var(--primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dropzone {
+      border: 2px dashed #94a3b8;
+      border-radius: var(--radius);
+      padding: 36px 20px;
+      text-align: center;
+      cursor: pointer;
+      background: #f8fafc;
+      transition: all 0.18s ease;
+    }
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--accent);
+      background: #eff6ff;
+    }
+    .dropzone input[type='file'] { display: none; }
+    .dropzone-icon { font-size: 2.2rem; margin-bottom: 8px; }
+    .file-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      background: #e0f2fe;
+      color: #0369a1;
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.88rem;
+      font-weight: 600;
+    }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .layout-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 8px; }
+    @media (max-width: 760px) {
+      .grid-2, .layout-grid { grid-template-columns: 1fr; }
+    }
+    label.field-label { display: block; font-size: 0.86rem; font-weight: 600; margin-bottom: 6px; color: #334155; }
+    select, input[type='number'] {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      font-size: 0.95rem;
+      background: #fff;
+    }
+    .layout-option {
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .layout-option input[type='radio'] { margin-right: 6px; }
+    .layout-option.active {
+      border-color: var(--accent);
+      background: #eff6ff;
+    }
+    .layout-option strong { font-size: 0.92rem; color: var(--primary); }
+    .layout-option span { font-size: 0.8rem; color: var(--muted); }
+    .toggle-list { display: flex; flex-direction: column; gap: 12px; margin-top: 6px; }
+    .toggle-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+    }
+    .toggle-item input[type='checkbox'] { width: 18px; height: 18px; margin-top: 2px; cursor: pointer; }
+    .btn-primary {
+      width: 100%;
+      padding: 14px 20px;
+      font-size: 1rem;
+      font-weight: 700;
+      color: #fff;
+      background: var(--accent);
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+    .status-box { display: none; }
+    .status-box.visible { display: block; }
+    .progress-bar-wrap {
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 999px;
+      overflow: hidden;
+      margin: 12px 0;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.35s ease;
+    }
+    .download-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--success);
+      color: #fff;
+      text-decoration: none;
+      padding: 12px 22px;
+      border-radius: 8px;
+      font-weight: 700;
+      margin-top: 12px;
+    }
+    .issue-card {
+      border-left: 4px solid var(--warn);
+      background: #fffbeb;
+      padding: 12px 14px;
+      border-radius: 6px;
+      margin-top: 10px;
+      font-size: 0.88rem;
+    }
+    .issue-card.high { border-left-color: var(--danger); background: #fef2f2; }
+    .issue-card.low { border-left-color: #3b82f6; background: #eff6ff; }
+    .meta-note { font-size: 0.8rem; color: var(--muted); margin-top: 10px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <h1>⚖️ Dịch Hợp Đồng Song Ngữ Tự Động (Việt • Hàn • Anh)</h1>
+        <p>Cloud Translation v3 Advanced • Giữ nguyên định dạng .docx/.xlsx • AI Legal Review</p>
+      </div>
+      <div class="badge-zero" id="authBadge">🔒 Zero Trust Protected</div>
+    </div>
+  </header>
+
+  <main>
+    <form id="translateForm">
+      <!-- Step 1: File Upload -->
+      <div class="card">
+        <div class="section-title">1. Tải lên Hợp đồng (.docx) hoặc Phụ lục bảng biểu (.xlsx)</div>
+        <div class="dropzone" id="dropzone">
+          <div class="dropzone-icon">📄</div>
+          <div><strong>Kéo thả file hợp đồng vào đây</strong> hoặc nhấn để chọn từ máy tính</div>
+          <div class="meta-note">Hỗ trợ: Word (.docx), Excel (.xlsx) • Tối đa 25MB • Tự động xoá trên Cloud sau 7 ngày</div>
+          <input type="file" id="fileInput" accept=".docx,.xlsx" />
+          <div id="selectedFilePill" class="file-pill hidden"></div>
+        </div>
+      </div>
+
+      <!-- Step 2: Language Pair & Layout -->
+      <div class="card">
+        <div class="section-title">2. Chọn Cặp Ngôn Ngữ & Bố Cục Song Ngữ</div>
+        <div class="grid-2">
+          <div>
+            <label class="field-label" for="langPairSelect">Cặp ngôn ngữ dịch thuật</label>
+            <select id="langPairSelect">
+              <option value="vi-ko">🇻🇳 Tiếng Việt → 🇰🇷 Tiếng Hàn (VI → KO)</option>
+              <option value="ko-vi">🇰🇷 Tiếng Hàn → 🇻🇳 Tiếng Việt (KO → VI)</option>
+              <option value="en-ko">🇬🇧 Tiếng Anh → 🇰🇷 Tiếng Hàn (EN → KO)</option>
+              <option value="ko-en">🇰🇷 Tiếng Hàn → 🇬🇧 Tiếng Anh (KO → EN)</option>
+              <option value="vi-en">🇻🇳 Tiếng Việt → 🇬🇧 Tiếng Anh (VI → EN)</option>
+              <option value="en-vi">🇬🇧 Tiếng Anh → 🇻🇳 Tiếng Việt (EN → VI)</option>
+            </select>
+          </div>
+          <div id="replaceColWrapper" class="hidden">
+            <label class="field-label" for="replaceColIndex">Cột cần ghi đè (0 = Cột trái, 1 = Cột phải)</label>
+            <input type="number" id="replaceColIndex" min="0" max="10" value="1" />
+          </div>
+        </div>
+
+        <label class="field-label" style="margin-top: 16px;">Kiểu trình bày hợp đồng song ngữ đầu ra</label>
+        <div class="layout-grid" id="layoutGroup">
+          <label class="layout-option active">
+            <div><input type="radio" name="layout_mode" value="side_by_side" checked /><strong>Bảng 2 cột đối chiếu</strong></div>
+            <span>Câu gốc cột trái — Bản dịch cột phải (Side-by-side chuẩn pháp chế).</span>
+          </label>
+          <label class="layout-option">
+            <div><input type="radio" name="layout_mode" value="alternating" /><strong>Đoạn văn xen kẽ</strong></div>
+            <span>Mỗi điều khoản gốc theo sau ngay bởi đoạn dịch bên dưới.</span>
+          </label>
+          <label class="layout-option">
+            <div><input type="radio" name="layout_mode" value="replace_column" /><strong>Thay thế cột ngôn ngữ</strong></div>
+            <span>Đè cột Tiếng Anh bằng Tiếng Hàn (chuyển hợp đồng Vi-En sang Vi-Hàn).</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Step 3: Glossary & AI Legal Review -->
+      <div class="card">
+        <div class="section-title">3. Từ Điển Pháp Lý & Thẩm Định Rủi Ro AI</div>
+        <div class="toggle-list">
+          <label class="toggle-item">
+            <input type="checkbox" id="useGlossary" checked />
+            <div>
+              <strong>Áp dụng Từ điển Thuật ngữ Pháp lý Chuẩn (Custom Glossary)</strong>
+              <div class="meta-note" style="margin-top:2px;">Chuẩn hóa thuật ngữ chuyên ngành Việt - Hàn - Anh (손해배상, 위약금, 불가항력, Bất khả kháng, Phạt vi phạm...).</div>
+            </div>
+          </label>
+          <label class="toggle-item">
+            <input type="checkbox" id="enableLegalReview" />
+            <div>
+              <strong>Bật AI Legal Review (Gắn cờ cảnh báo + Comment bên lề)</strong>
+              <div class="meta-note" style="margin-top:2px;">Agent Legal (Claude Sonnet / Gemini) kiểm tra sai số tiền, nhảy số điều khoản, phạt vi phạm và chèn Comment vào lề file Word/Excel — <em>tuyệt đối không tự ý sửa nội dung gốc</em>.</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <button type="submit" class="btn-primary" id="submitBtn">🚀 Dịch & Xuất Hợp Đồng Song Ngữ</button>
+    </form>
+
+    <!-- Status, Download & Legal Review Output -->
+    <div class="card status-box" id="statusCard" style="margin-top: 22px;">
+      <div class="section-title" id="statusTitle">⏳ Đang xử lý tài liệu...</div>
+      <p id="statusDesc" style="font-size: 0.92rem; color: var(--muted);"></p>
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div id="metricsInfo" class="meta-note"></div>
+      <div id="downloadContainer"></div>
+      <div id="legalReviewContainer" style="margin-top: 18px;"></div>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

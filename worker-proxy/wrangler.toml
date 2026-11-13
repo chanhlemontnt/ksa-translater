@@ -1,0 +1,17 @@
+name = "dich-hop-dong-router"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+# Route entire unified domain dich.tnt.name.vn through this Worker
+# (/ -> Cloudflare Pages, /api/* -> Cloud Run)
+routes = [
+  { pattern = "dich.tnt.name.vn/*", zone_name = "tnt.name.vn" }
+]
+
+[vars]
+# Replace with real Cloud Run & Pages URLs after running infra/deploy.sh
+CLOUD_RUN_ORIGIN = "https://REPLACE_WITH_CLOUD_RUN_URL.a.run.app"
+PAGES_ORIGIN = "https://REPLACE_WITH_PAGES_PROJECT.pages.dev"
+
+# Secret (DO NOT put real secret in this file! Set via CLI):
+# npx wrangler secret put WORKER_SHARED_SECRET
