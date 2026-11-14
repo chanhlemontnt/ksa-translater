@@ -101,6 +101,21 @@ class PdfExtractionResult(BaseModel):
         doc.save(buf)
         return buf.getvalue()
 
+    def to_plain_text(self) -> str:
+        """Converts normalized paragraphs & tables into plain text."""
+        parts: list[str] = []
+        for block in self.blocks:
+            if block.kind == "paragraph" and block.text:
+                text = block.text.strip()
+                if text:
+                    parts.append(text)
+            elif block.kind == "table" and block.table and block.table.rows:
+                for row in block.table.rows:
+                    line = " | ".join(c.strip() for c in row if c and c.strip())
+                    if line:
+                        parts.append(line)
+        return "\n\n".join(parts)
+
 
 class VisionOCRService:
     """Auto-detects Text vs Scanned PDF and extracts normalized paragraphs & tables."""
@@ -139,6 +154,72 @@ class VisionOCRService:
 
         logger.info("PDF '%s' detected as Scanned PDF (%d pages); invoking Google Cloud Vision DOCUMENT_TEXT_DETECTION.", filename, page_count)
         return self._extract_scanned_pdf_vision(file_bytes, filename, page_count)
+
+    def extract_image(self, file_bytes: bytes, filename: str = "image.png") -> PdfExtractionResult:
+        """Extracts normalized blocks from an image (.png/.jpg/.jpeg) via Google Cloud Vision."""
+        from google.cloud import vision
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(file_bytes)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img_buf = io.BytesIO()
+            img.save(img_buf, format="PNG")
+            png_bytes = img_buf.getvalue()
+
+        rotator = get_project_rotator()
+        pool_size = max(1, len(rotator.get_pool_summary()))
+        vision_image = vision.Image(content=png_bytes)
+        image_context = vision.ImageContext(language_hints=VISION_LANGUAGE_HINTS)
+
+        response = None
+        last_exc: Optional[Exception] = None
+        projects_used: list[str] = []
+        vision_requests_used = 0
+
+        for attempt in range(pool_size):
+            client, project = rotator.get_vision_client(estimated_requests=1)
+            try:
+                response = client.document_text_detection(
+                    image=vision_image,
+                    image_context=image_context,
+                    timeout=60.0,
+                )
+                if response.error and response.error.message:
+                    raise RuntimeError(f"Vision API error on image '{filename}': {response.error.message}")
+                rotator.record_vision_usage(project.project_id, 1)
+                vision_requests_used += 1
+                projects_used.append(project.project_id)
+                break
+            except gcp_exceptions.ResourceExhausted as exc:
+                logger.warning(
+                    "Vision API quota exhausted on project %s (attempt %d/%d); rotating.",
+                    project.project_id,
+                    attempt + 1,
+                    pool_size,
+                )
+                rotator.mark_vision_exhausted(project.project_id)
+                last_exc = exc
+                response = None
+                continue
+
+        if response is None:
+            raise RuntimeError(
+                f"All GCP projects exhausted Vision API quota for image '{filename}': {last_exc}"
+            )
+
+        blocks = self._parse_vision_page_response(response, 1, vision)
+        char_count = self._count_block_chars(blocks)
+        return PdfExtractionResult(
+            filename=filename,
+            pdf_type="scanned_pdf",
+            page_count=1,
+            char_count=char_count,
+            blocks=blocks,
+            vision_requests_used=vision_requests_used,
+            projects_used=projects_used,
+        )
 
     # ------------------------------------------------------------------
     # Text PDF Extraction (0 Vision API quota)

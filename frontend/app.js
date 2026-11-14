@@ -24,8 +24,38 @@
   const legalReviewContainer = document.getElementById('legalReviewContainer');
   const authBadge = document.getElementById('authBadge');
 
+  const tabTranslateBtn = document.getElementById('tabTranslateBtn');
+  const tabOcrBtn = document.getElementById('tabOcrBtn');
+  const translatePanel = document.getElementById('translatePanel');
+  const ocrPanel = document.getElementById('ocrPanel');
+
+  const ocrForm = document.getElementById('ocrForm');
+  const ocrDropzone = document.getElementById('ocrDropzone');
+  const ocrFileInput = document.getElementById('ocrFileInput');
+  const ocrFilePill = document.getElementById('ocrFilePill');
+  const ocrSubmitBtn = document.getElementById('ocrSubmitBtn');
+  const ocrStatusCard = document.getElementById('ocrStatusCard');
+  const ocrStatusTitle = document.getElementById('ocrStatusTitle');
+  const ocrStatusDesc = document.getElementById('ocrStatusDesc');
+  const ocrProgressBar = document.getElementById('ocrProgressBar');
+  const ocrMetricsInfo = document.getElementById('ocrMetricsInfo');
+  const ocrDownloadContainer = document.getElementById('ocrDownloadContainer');
+  const ocrTextPreviewContainer = document.getElementById('ocrTextPreviewContainer');
+  const ocrTextPreview = document.getElementById('ocrTextPreview');
+
   let currentFile = null;
+  let currentOcrFile = null;
   let pollTimer = null;
+
+  function switchTab(tab) {
+    const isOcr = tab === 'ocr';
+    tabTranslateBtn.classList.toggle('active', !isOcr);
+    tabOcrBtn.classList.toggle('active', isOcr);
+    translatePanel.classList.toggle('hidden', isOcr);
+    ocrPanel.classList.toggle('hidden', !isOcr);
+  }
+  tabTranslateBtn.addEventListener('click', () => switchTab('translate'));
+  tabOcrBtn.addEventListener('click', () => switchTab('ocr'));
 
   function formatErrorDetail(detail, fallback) {
     if (Array.isArray(detail)) {
@@ -228,8 +258,17 @@
       pollTimer = null;
     }
 
-    const [srcLang, tgtLang] = langPairSelect.value.split('-');
-    const layoutMode = document.querySelector('input[name="layout_mode"]:checked')?.value || 'side_by_side';
+    let srcLang;
+    let tgtLang;
+    if (langPairSelect.value === 'vi-en-kr') {
+      srcLang = 'vi';
+      tgtLang = 'en,ko';
+    } else {
+      [srcLang, tgtLang] = langPairSelect.value.split('-');
+    }
+    const layoutMode = document.querySelector('input[name="layout_mode"]:checked')?.value || 'alternating';
+    // TODO(vi-en-kr-replace-column): Khi anh Thanh chốt quy tắc "thay thế khi cột EN bất đồng với VI",
+    // cập nhật UI/tham số gửi lên backend nếu cần.
 
     const formData = new FormData();
     formData.append('file', currentFile);
@@ -274,6 +313,103 @@
       progressBar.style.width = '0%';
       statusTitle.textContent = '❌ Không thể thực hiện dịch thuật';
       statusDesc.textContent = err.message || String(err);
+    }
+  });
+
+  // Tab 2: OCR Only Dropzone & Submit
+  function setOcrFile(file) {
+    if (!file) return;
+    const lower = file.name.toLowerCase();
+    if (
+      !lower.endsWith('.pdf') &&
+      !lower.endsWith('.png') &&
+      !lower.endsWith('.jpg') &&
+      !lower.endsWith('.jpeg')
+    ) {
+      alert('Vui lòng chỉ chọn file PDF (.pdf) hoặc ảnh (.png, .jpg, .jpeg).');
+      return;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      alert('Dung lượng file vượt quá giới hạn 25MB.');
+      return;
+    }
+    currentOcrFile = file;
+    const kb = (file.size / 1024).toFixed(1);
+    const icon = lower.endsWith('.pdf') ? '📕' : '🖼️';
+    ocrFilePill.textContent = `${icon} ${file.name} (${kb} KB)`;
+    ocrFilePill.classList.remove('hidden');
+  }
+
+  ocrDropzone.addEventListener('click', () => ocrFileInput.click());
+  ocrFileInput.addEventListener('change', (e) => {
+    if (e.target.files && e.target.files[0]) setOcrFile(e.target.files[0]);
+  });
+  ocrDropzone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    ocrDropzone.classList.add('dragover');
+  });
+  ocrDropzone.addEventListener('dragleave', () => ocrDropzone.classList.remove('dragover'));
+  ocrDropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    ocrDropzone.classList.remove('dragover');
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) setOcrFile(e.dataTransfer.files[0]);
+  });
+
+  ocrForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!currentOcrFile) {
+      alert('Vui lòng chọn file PDF hoặc ảnh (.pdf, .png, .jpg, .jpeg) trước khi OCR.');
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', currentOcrFile);
+
+    ocrSubmitBtn.disabled = true;
+    ocrStatusCard.classList.add('visible');
+    ocrStatusTitle.textContent = '⏳ Đang trích xuất văn bản (OCR)...';
+    ocrStatusDesc.textContent = 'Đang xử lý PDF/ảnh bằng Google Cloud Vision OCR & tạo file Word (.docx).';
+    ocrProgressBar.style.width = '45%';
+    ocrMetricsInfo.textContent = '';
+    ocrDownloadContainer.innerHTML = '';
+    ocrTextPreviewContainer.classList.add('hidden');
+    ocrTextPreview.textContent = '';
+
+    try {
+      const res = await fetch('/api/ocr', {
+        method: 'POST',
+        body: formData,
+        credentials: 'include',
+      });
+      const data = await readApiResponse(res);
+
+      ocrSubmitBtn.disabled = false;
+      ocrProgressBar.style.width = '100%';
+      ocrStatusTitle.textContent = '✅ Trích xuất OCR hoàn tất!';
+      ocrStatusDesc.textContent = 'File Word (.docx) đã sẵn sàng tải xuống (không dịch thuật).';
+
+      if (data.metrics) {
+        const m = data.metrics;
+        const note = m.pdf_type === 'text_pdf'
+          ? 'Text PDF (0 quota OCR)'
+          : `Vision OCR: ${m.ocr_vision_requests || 0} trang`;
+        ocrMetricsInfo.textContent = `📊 Thống kê: ~${m.estimated_pages} trang • ${Number(m.char_count || 0).toLocaleString('vi-VN')} ký tự • ${note}`;
+      }
+
+      if (data.download_url) {
+        const fname = escapeHtml(data.output_filename || 'ocr-output.docx');
+        ocrDownloadContainer.innerHTML = `<a class="download-btn" href="${escapeHtml(data.download_url)}" download="${fname}">⬇️ Tải xuống: ${fname}</a>`;
+      }
+
+      if (data.text_preview) {
+        ocrTextPreview.textContent = data.text_preview + (data.text_truncated ? '\n\n... (đã rút gọn; tải file .docx để xem đầy đủ)' : '');
+        ocrTextPreviewContainer.classList.remove('hidden');
+      }
+    } catch (err) {
+      ocrSubmitBtn.disabled = false;
+      ocrProgressBar.style.width = '0%';
+      ocrStatusTitle.textContent = '❌ Không thể thực hiện OCR';
+      ocrStatusDesc.textContent = err.message || String(err);
     }
   });
 

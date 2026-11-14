@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.auth_cf_access import AuthenticatedUser, require_cf_access
-from app.bilingual_layout import build_bilingual_document
+from app.bilingual_layout import build_bilingual_document, build_trilingual_document
 from app.dlp_service import get_dlp_service
 from app.key_rotator import get_project_rotator
 from app.legal_review import LegalReviewResult, get_legal_review_service
@@ -38,7 +38,9 @@ from app.translation_service import (
     SYNC_MAX_CHARS,
     SYNC_MAX_PAGES,
     get_translation_service,
+    normalize_lang_pair,
 )
+from app.vision_ocr_service import get_vision_ocr_service
 
 logger = logging.getLogger("bilingual_contract_app")
 logging.basicConfig(
@@ -109,6 +111,7 @@ async def get_app_config(
     rotator = get_project_rotator()
     return {
         "user": {"email": get_dlp_service().sanitize_log_text(user.email)},
+        "default_layout": "alternating",
         "supported_pairs": [
             {"source": "vi", "target": "ko", "label": "Việt → Hàn (VI → KO)"},
             {"source": "ko", "target": "vi", "label": "Hàn → Việt (KO → VI)"},
@@ -116,22 +119,23 @@ async def get_app_config(
             {"source": "ko", "target": "en", "label": "Hàn → Anh (KO → EN)"},
             {"source": "vi", "target": "en", "label": "Việt → Anh (VI → EN)"},
             {"source": "en", "target": "vi", "label": "Anh → Việt (EN → VI)"},
+            {"id": "vi-en-kr", "source": "vi", "target": "en,ko", "label": "Việt → Anh & Hàn (VI → EN + KO)"},
         ],
         "layout_modes": [
             {
-                "id": "side_by_side",
-                "label": "Bảng 2 cột đối chiếu (Side-by-side)",
-                "description": " Đặt câu gốc cột trái, bản dịch cột phải, giữ định dạng điều khoản.",
-            },
-            {
                 "id": "alternating",
-                "label": "Đoạn văn song song xen kẽ (Alternating)",
-                "description": "Mỗi đoạn gốc theo sau ngay bởi đoạn dịch đối ứng.",
+                "label": "Đoạn văn xen kẽ (Alternating)",
+                "description": "Mỗi đoạn gốc theo sau ngay bởi đoạn dịch đối ứng (Mặc định).",
             },
             {
                 "id": "replace_column",
-                "label": "Đè/thay thế cột ngôn ngữ đích (Replace Column)",
+                "label": "Thay thế ngôn ngữ (Replace Column)",
                 "description": "Chuyển hợp đồng song ngữ sẵn có (VD: Việt-Anh → Việt-Hàn) bằng cách thay cột phải.",
+            },
+            {
+                "id": "side_by_side",
+                "label": "Bảng đối chiếu (Side-by-side)",
+                "description": "Đặt câu gốc cột trái, bản dịch cột phải (2 hoặc 3 cột), giữ định dạng điều khoản.",
             },
         ],
         "thresholds": {
@@ -149,14 +153,14 @@ async def translate_contract(
     request: Request,
     file: UploadFile = File(..., description="Hợp đồng .docx, .pdf hoặc bảng biểu .xlsx"),
     source_lang: str = Form(..., description="Mã ngôn ngữ nguồn: vi | en | ko"),
-    target_lang: str = Form(..., description="Mã ngôn ngữ đích: ko | vi | en"),
-    layout_mode: Literal["side_by_side", "alternating", "replace_column"] = Form("side_by_side"),
+    target_lang: str = Form(..., description="Mã ngôn ngữ đích: ko | vi | en | en,ko"),
+    layout_mode: Literal["side_by_side", "alternating", "replace_column"] = Form("alternating"),
     use_glossary: bool = Form(True),
     enable_legal_review: bool = Form(False),
     replace_col_index: int = Form(1, ge=0, le=10),
     user: AuthenticatedUser = Depends(require_cf_access),
 ) -> JSONResponse:
-    """Main endpoint to upload and translate a legal contract (.docx / .xlsx).
+    """Main endpoint to upload and translate a legal contract (.docx / .xlsx / .pdf).
 
     - Small files (<=15 pages AND <=20,000 chars): synchronous translateDocument -> layout -> legal review.
     - Large files (>15 pages OR >20,000 chars): asynchronous batchTranslateDocument on GCS + polling.
@@ -165,13 +169,21 @@ async def translate_contract(
     translation_svc = get_translation_service()
     legal_svc = get_legal_review_service()
 
-    src = source_lang.strip().lower()
-    tgt = target_lang.strip().lower()
+    src, tgt = normalize_lang_pair(source_lang, target_lang)
     if (src, tgt) not in SUPPORTED_LANG_PAIRS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cặp ngôn ngữ '{src} -> {tgt}' chưa được hỗ trợ. Hỗ trợ: vi-ko, en-ko, vi-en (2 chiều).",
+            detail=f"Cặp ngôn ngữ '{src} -> {tgt}' chưa được hỗ trợ. Hỗ trợ: vi-ko, en-ko, vi-en (2 chiều) và vi-en-kr.",
         )
+
+    is_trilingual = (src == "vi" and tgt == "en,ko")
+    effective_tgt = tgt
+    if is_trilingual and layout_mode == "replace_column":
+        # TODO(vi-en-kr-replace-column): Pending clarification from Anh Thanh on
+        # "thay thế khi cột EN bất đồng với VI". Currently treats vi-en-kr + replace_column
+        # as VI -> KO overwriting EN column (same as vi-kr).
+        is_trilingual = False
+        effective_tgt = "ko"
 
     raw_filename = file.filename or "contract.docx"
     ext = Path(raw_filename).suffix.lower()
@@ -252,14 +264,40 @@ async def translate_contract(
 
     # 2A. ASYNC FLOW (> 15 pages OR > 20,000 chars)
     if metrics.requires_async:
-        batch_meta = translation_svc.start_batch_async(
-            session_id=job_id,
-            file_bytes=working_bytes,
-            metrics=metrics,
-            source_lang=src,
-            target_lang=tgt,
-            use_glossary=use_glossary,
-        )
+        if is_trilingual:
+            batch_en = translation_svc.start_batch_async(
+                session_id=job_id,
+                file_bytes=working_bytes,
+                metrics=metrics,
+                source_lang=src,
+                target_lang="en",
+                use_glossary=use_glossary,
+                stage_tag="en",
+            )
+            batch_ko = translation_svc.start_batch_async(
+                session_id=job_id,
+                file_bytes=working_bytes,
+                metrics=metrics,
+                source_lang=src,
+                target_lang="ko",
+                use_glossary=use_glossary,
+                stage_tag="ko",
+            )
+            batch_meta = {
+                "multi_target": True,
+                "targets": {"en": batch_en, "ko": batch_ko},
+                "bucket": batch_ko.get("bucket") or batch_en.get("bucket"),
+                "project_id": batch_ko.get("project_id") or batch_en.get("project_id"),
+            }
+        else:
+            batch_meta = translation_svc.start_batch_async(
+                session_id=job_id,
+                file_bytes=working_bytes,
+                metrics=metrics,
+                source_lang=src,
+                target_lang=effective_tgt,
+                use_glossary=use_glossary,
+            )
         job_state = {
             "job_id": job_id,
             "mode": "async",
@@ -268,6 +306,8 @@ async def translate_contract(
             "created_at": int(started_at),
             "source_lang": src,
             "target_lang": tgt,
+            "effective_target_lang": effective_tgt,
+            "is_trilingual": is_trilingual,
             "layout_mode": layout_mode,
             "use_glossary": use_glossary,
             "enable_legal_review": enable_legal_review,
@@ -298,36 +338,66 @@ async def translate_contract(
         )
 
     # 2B. SYNC FLOW (<= 15 pages AND <= 20,000 chars)
-    translated_raw_bytes, project_used = translation_svc.translate_sync(
-        session_id=job_id,
-        file_bytes=working_bytes,
-        metrics=metrics,
-        source_lang=src,
-        target_lang=tgt,
-        use_glossary=use_glossary,
-    )
-
-    # 3. Build Bilingual Layout (.docx / .xlsx)
-    final_bytes = build_bilingual_document(
-        original_bytes=working_bytes,
-        translated_bytes=translated_raw_bytes,
-        extension=working_ext,
-        layout_mode=layout_mode,
-        source_lang=src,
-        target_lang=tgt,
-        replace_col_index=replace_col_index,
-    )
+    if is_trilingual:
+        translated_en_bytes, project_en = translation_svc.translate_sync(
+            session_id=job_id,
+            file_bytes=working_bytes,
+            metrics=metrics,
+            source_lang=src,
+            target_lang="en",
+            use_glossary=use_glossary,
+        )
+        translated_ko_bytes, project_used = translation_svc.translate_sync(
+            session_id=job_id,
+            file_bytes=working_bytes,
+            metrics=metrics,
+            source_lang=src,
+            target_lang="ko",
+            use_glossary=use_glossary,
+        )
+        final_bytes = build_trilingual_document(
+            original_bytes=working_bytes,
+            translated_en_bytes=translated_en_bytes,
+            translated_ko_bytes=translated_ko_bytes,
+            extension=working_ext,
+            layout_mode=layout_mode,
+            source_lang=src,
+        )
+        review_target_bytes = translated_ko_bytes
+        review_target_lang = "ko"
+        project_used = project_used or project_en
+    else:
+        translated_raw_bytes, project_used = translation_svc.translate_sync(
+            session_id=job_id,
+            file_bytes=working_bytes,
+            metrics=metrics,
+            source_lang=src,
+            target_lang=effective_tgt,
+            use_glossary=use_glossary,
+        )
+        # 3. Build Bilingual Layout (.docx / .xlsx)
+        final_bytes = build_bilingual_document(
+            original_bytes=working_bytes,
+            translated_bytes=translated_raw_bytes,
+            extension=working_ext,
+            layout_mode=layout_mode,
+            source_lang=src,
+            target_lang=effective_tgt,
+            replace_col_index=replace_col_index,
+        )
+        review_target_bytes = translated_raw_bytes
+        review_target_lang = effective_tgt
 
     # 4. Optional AI Legal Review (warning flags + marginal comments ONLY; never mutates contract text)
     legal_result: Optional[LegalReviewResult] = None
     if enable_legal_review:
         final_bytes, legal_result = await legal_svc.review_and_annotate(
             original_bytes=working_bytes,
-            translated_bytes=translated_raw_bytes,
+            translated_bytes=review_target_bytes,
             merged_bilingual_bytes=final_bytes,
             extension=working_ext,
             source_lang=src,
-            target_lang=tgt,
+            target_lang=review_target_lang,
         )
 
     # 5. Store untouched final file for download (DLP NEVER applied to user download artifact!)
@@ -413,51 +483,93 @@ async def get_job_status(
             "legal_review": state.get("legal_review"),
         }
 
-    # Poll Google Cloud Translation LRO operation
-    batch_check = translation_svc.check_batch_operation(state["batch_meta"])
-    if not batch_check["done"]:
-        return {
-            "job_id": job_id,
-            "mode": "async",
-            "status": "processing",
-            "message": "Đang dịch tài liệu trên Google Cloud Translation (Batch)...",
-            "metrics": state.get("metrics"),
-        }
+    # Poll Google Cloud Translation LRO operation(s)
+    batch_meta = state["batch_meta"]
+    if batch_meta.get("multi_target"):
+        targets_meta = batch_meta["targets"]
+        check_en = translation_svc.check_batch_operation(targets_meta["en"])
+        check_ko = translation_svc.check_batch_operation(targets_meta["ko"])
 
-    if batch_check.get("error"):
-        state["status"] = "failed"
-        state["error"] = dlp.sanitize_log_text(str(batch_check["error"]))
-        translation_svc.save_job_state(job_id=job_id, state=state)
-        return {
-            "job_id": job_id,
-            "mode": "async",
-            "status": "failed",
-            "error": state["error"],
-        }
+        if check_en.get("error") or check_ko.get("error"):
+            err_msg = check_en.get("error") or check_ko.get("error")
+            state["status"] = "failed"
+            state["error"] = dlp.sanitize_log_text(str(err_msg))
+            translation_svc.save_job_state(job_id=job_id, state=state)
+            return {
+                "job_id": job_id,
+                "mode": "async",
+                "status": "failed",
+                "error": state["error"],
+            }
 
-    # Batch succeeded -> assemble bilingual layout + optional AI Legal Review
-    original_bytes = translation_svc.load_session_artifact(state["original_ref"])
-    translated_raw_bytes = batch_check["translated_bytes"]
+        if not check_en["done"] or not check_ko["done"]:
+            return {
+                "job_id": job_id,
+                "mode": "async",
+                "status": "processing",
+                "message": "Đang dịch tài liệu 3 ngôn ngữ (VI → EN & KO) trên Google Cloud...",
+                "metrics": state.get("metrics"),
+            }
 
-    final_bytes = build_bilingual_document(
-        original_bytes=original_bytes,
-        translated_bytes=translated_raw_bytes,
-        extension=state["extension"],
-        layout_mode=state["layout_mode"],
-        source_lang=state["source_lang"],
-        target_lang=state["target_lang"],
-        replace_col_index=state.get("replace_col_index", 1),
-    )
+        original_bytes = translation_svc.load_session_artifact(state["original_ref"])
+        translated_en_bytes = check_en["translated_bytes"]
+        translated_ko_bytes = check_ko["translated_bytes"]
+        final_bytes = build_trilingual_document(
+            original_bytes=original_bytes,
+            translated_en_bytes=translated_en_bytes,
+            translated_ko_bytes=translated_ko_bytes,
+            extension=state["extension"],
+            layout_mode=state["layout_mode"],
+            source_lang=state["source_lang"],
+        )
+        review_target_bytes = translated_ko_bytes
+        review_target_lang = "ko"
+    else:
+        batch_check = translation_svc.check_batch_operation(batch_meta)
+        if not batch_check["done"]:
+            return {
+                "job_id": job_id,
+                "mode": "async",
+                "status": "processing",
+                "message": "Đang dịch tài liệu trên Google Cloud Translation (Batch)...",
+                "metrics": state.get("metrics"),
+            }
+
+        if batch_check.get("error"):
+            state["status"] = "failed"
+            state["error"] = dlp.sanitize_log_text(str(batch_check["error"]))
+            translation_svc.save_job_state(job_id=job_id, state=state)
+            return {
+                "job_id": job_id,
+                "mode": "async",
+                "status": "failed",
+                "error": state["error"],
+            }
+
+        original_bytes = translation_svc.load_session_artifact(state["original_ref"])
+        translated_raw_bytes = batch_check["translated_bytes"]
+        eff_tgt = state.get("effective_target_lang") or state["target_lang"]
+        final_bytes = build_bilingual_document(
+            original_bytes=original_bytes,
+            translated_bytes=translated_raw_bytes,
+            extension=state["extension"],
+            layout_mode=state["layout_mode"],
+            source_lang=state["source_lang"],
+            target_lang=eff_tgt,
+            replace_col_index=state.get("replace_col_index", 1),
+        )
+        review_target_bytes = translated_raw_bytes
+        review_target_lang = eff_tgt
 
     legal_result: Optional[LegalReviewResult] = None
     if state.get("enable_legal_review"):
         final_bytes, legal_result = await legal_svc.review_and_annotate(
             original_bytes=original_bytes,
-            translated_bytes=translated_raw_bytes,
+            translated_bytes=review_target_bytes,
             merged_bilingual_bytes=final_bytes,
             extension=state["extension"],
             source_lang=state["source_lang"],
-            target_lang=state["target_lang"],
+            target_lang=review_target_lang,
         )
 
     final_ref = translation_svc.store_session_artifact(
@@ -524,5 +636,120 @@ async def download_translated_contract(
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
             "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.post("/api/ocr")
+async def ocr_only_endpoint(
+    file: UploadFile = File(..., description="File PDF hoặc ảnh (.pdf, .png, .jpg, .jpeg)"),
+    user: AuthenticatedUser = Depends(require_cf_access),
+) -> JSONResponse:
+    """Standalone OCR endpoint: extracts text/tables from PDF or image into .docx without translating."""
+    dlp = get_dlp_service()
+    translation_svc = get_translation_service()
+    ocr_svc = get_vision_ocr_service()
+
+    raw_filename = file.filename or "document.pdf"
+    ext = Path(raw_filename).suffix.lower()
+    if ext not in (".pdf", ".png", ".jpg", ".jpeg"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Chỉ hỗ trợ OCR file PDF (.pdf) hoặc ảnh (.png, .jpg, .jpeg).",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File tải lên rỗng.")
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Dung lượng file vượt ngưỡng tối đa {MAX_UPLOAD_MB}MB.",
+        )
+
+    job_id = str(uuid.uuid4())
+    started_at = time.time()
+
+    if ext == ".pdf":
+        extraction = ocr_svc.extract_pdf(file_bytes=file_bytes, filename=raw_filename)
+        orig_mime = MIME_PDF
+    else:
+        extraction = ocr_svc.extract_image(file_bytes=file_bytes, filename=raw_filename)
+        orig_mime = "image/png" if ext == ".png" else "image/jpeg"
+
+    docx_bytes = extraction.to_docx_bytes()
+    plain_text = extraction.to_plain_text()
+
+    stem = Path(raw_filename).stem or "document"
+    clean_stem = "".join(ch if ch.isalnum() or ch in ("-", "_", ".", " ") else "_" for ch in stem).strip()
+    output_filename = f"{clean_stem}_ocr.docx"
+
+    safe_audit = dlp.sanitize_dict(
+        {
+            "event": "ocr_only_requested",
+            "job_id": job_id,
+            "user_email": user.email,
+            "original_filename": raw_filename,
+            "pdf_type": extraction.pdf_type,
+            "page_count": extraction.page_count,
+            "char_count": extraction.char_count,
+            "ocr_vision_requests": extraction.vision_requests_used,
+            "timestamp": int(started_at),
+        }
+    )
+    logger.info("OCR Job %s completed: %s", job_id, safe_audit)
+    dlp.save_redacted_audit_log(session_id=job_id, audit_payload=safe_audit)
+
+    translation_svc.store_session_artifact(
+        session_id=job_id,
+        stage="original",
+        filename=raw_filename,
+        content=file_bytes,
+        mime_type=orig_mime,
+    )
+    final_ref = translation_svc.store_session_artifact(
+        session_id=job_id,
+        stage="final",
+        filename=output_filename,
+        content=docx_bytes,
+        mime_type=MIME_DOCX,
+    )
+
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    metrics_payload = {
+        "filename": raw_filename,
+        "pdf_type": extraction.pdf_type,
+        "estimated_pages": extraction.page_count,
+        "char_count": extraction.char_count,
+        "ocr_vision_requests": extraction.vision_requests_used,
+    }
+    completed_state = {
+        "job_id": job_id,
+        "mode": "ocr",
+        "status": "completed",
+        "owner_sub": user.sub,
+        "created_at": int(started_at),
+        "completed_at": int(time.time()),
+        "elapsed_ms": elapsed_ms,
+        "output_filename": output_filename,
+        "mime_type": MIME_DOCX,
+        "final_ref": final_ref,
+        "metrics": metrics_payload,
+    }
+    translation_svc.save_job_state(job_id=job_id, state=completed_state)
+
+    preview_limit = 6000
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "job_id": job_id,
+            "mode": "ocr",
+            "status": "completed",
+            "elapsed_ms": elapsed_ms,
+            "output_filename": output_filename,
+            "download_url": f"/api/jobs/{job_id}/download",
+            "metrics": metrics_payload,
+            "text_preview": plain_text[:preview_limit],
+            "text_truncated": len(plain_text) > preview_limit,
         },
     )

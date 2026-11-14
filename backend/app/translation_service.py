@@ -48,7 +48,19 @@ SUPPORTED_LANG_PAIRS: set[tuple[str, str]] = {
     ("ko", "en"),
     ("vi", "en"),
     ("en", "vi"),
+    ("vi", "en,ko"),
 }
+
+
+def normalize_lang_pair(source_lang: str, target_lang: str) -> tuple[str, str]:
+    """Normalizes UI/API language pair codes (supports vi-en-kr -> source='vi', target='en,ko')."""
+    src = source_lang.strip().lower()
+    tgt = target_lang.strip().lower().replace(" ", "")
+    if tgt == "kr":
+        tgt = "ko"
+    elif tgt in ("en,kr", "en-kr", "en-ko", "en+ko", "en+kr"):
+        tgt = "en,ko"
+    return src, tgt
 
 LOCAL_FALLBACK_DIR = Path(os.getenv("LOCAL_SESSION_DIR", "/tmp/dich-hop-dong-sessions"))
 
@@ -261,6 +273,7 @@ class TranslationService:
         source_lang: str,
         target_lang: str,
         use_glossary: bool = True,
+        stage_tag: str = "",
     ) -> dict[str, Any]:
         """Uploads input contract to GCS and triggers batch_translate_document LRO."""
         rotator = get_project_rotator()
@@ -271,9 +284,10 @@ class TranslationService:
                 "GCS_SESSION_BUCKET (or per-project gcs_bucket) is required for batchTranslateDocument (>15 pages / >20k chars)."
             )
 
+        suffix = f"_{stage_tag}" if stage_tag else ""
         safe_in_name = f"input{metrics.extension}"
-        input_blob_path = f"sessions/{session_id}/batch_in/{safe_in_name}"
-        output_prefix_path = f"sessions/{session_id}/batch_out/"
+        input_blob_path = f"sessions/{session_id}/batch_in{suffix}/{safe_in_name}"
+        output_prefix_path = f"sessions/{session_id}/batch_out{suffix}/"
 
         bucket = self.storage_client.bucket(bucket_name)
         in_blob = bucket.blob(input_blob_path)
