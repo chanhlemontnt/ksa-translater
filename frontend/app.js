@@ -181,7 +181,15 @@
       } else if (data.metrics.pdf_type === 'scanned_pdf') {
         pdfNote = ` • Scanned PDF (Vision OCR: ${data.metrics.ocr_vision_requests || 0} trang)`;
       }
-      metricsInfo.textContent = `📊 Thống kê: ~${data.metrics.estimated_pages} trang • ${Number(data.metrics.char_count || 0).toLocaleString('vi-VN')} ký tự trích xuất${pdfNote}`;
+      let enNote = '';
+      if (data.en_check && data.en_check.enabled) {
+        if (data.en_check.status === 'ok') {
+          enNote = ` • Kiểm EN: ${data.en_check.checked_count} đoạn (sửa ${data.en_check.corrected_count})`;
+        } else if (data.en_check.status === 'skipped_unavailable') {
+          enNote = ' • Kiểm EN: bỏ qua (chưa cấu hình Gemini)';
+        }
+      }
+      metricsInfo.textContent = `📊 Thống kê: ~${data.metrics.estimated_pages} trang • ${Number(data.metrics.char_count || 0).toLocaleString('vi-VN')} ký tự trích xuất${pdfNote}${enNote}`;
     }
 
     if (data.download_url) {
@@ -267,8 +275,6 @@
       [srcLang, tgtLang] = langPairSelect.value.split('-');
     }
     const layoutMode = document.querySelector('input[name="layout_mode"]:checked')?.value || 'alternating';
-    // TODO(vi-en-kr-replace-column): Khi anh Thanh chốt quy tắc "thay thế khi cột EN bất đồng với VI",
-    // cập nhật UI/tham số gửi lên backend nếu cần.
 
     const formData = new FormData();
     formData.append('file', currentFile);
