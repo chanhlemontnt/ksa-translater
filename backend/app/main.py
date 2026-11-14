@@ -71,6 +71,16 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch unhandled exceptions and return JSON 500 instead of plain text."""
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Lỗi hệ thống nội bộ. Vui lòng thử lại sau."},
+    )
+
+
 def _safe_output_filename(original_name: str, source_lang: str, target_lang: str, layout_mode: str) -> str:
     stem = Path(original_name).stem or "contract"
     ext = Path(original_name).suffix.lower() or ".docx"

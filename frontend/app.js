@@ -27,12 +27,58 @@
   let currentFile = null;
   let pollTimer = null;
 
+  function formatErrorDetail(detail, fallback) {
+    if (Array.isArray(detail)) {
+      const msgs = detail
+        .map((item) => {
+          if (item && typeof item === 'object') {
+            const loc = Array.isArray(item.loc) ? item.loc.join('.') : '';
+            const msg = item.msg || JSON.stringify(item);
+            return loc ? `${loc}: ${msg}` : msg;
+          }
+          return String(item);
+        })
+        .filter(Boolean);
+      return msgs.length ? msgs.join('; ') : fallback;
+    }
+    if (detail && typeof detail === 'object') {
+      return detail.message || JSON.stringify(detail);
+    }
+    return detail ? String(detail) : fallback;
+  }
+
+  async function readApiResponse(res) {
+    const rawText = await res.text();
+    let data = null;
+    let isJson = false;
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+        isJson = true;
+      } catch (_) {
+        isJson = false;
+      }
+    }
+    if (!res.ok) {
+      if (isJson && data && typeof data === 'object' && data.detail !== undefined) {
+        throw new Error(formatErrorDetail(data.detail, `HTTP ${res.status}`));
+      }
+      const snippet = (rawText || res.statusText || 'Lỗi không xác định').trim().slice(0, 200);
+      throw new Error(`HTTP ${res.status}: ${snippet}`);
+    }
+    if (!isJson || data === null) {
+      const snippet = (rawText || '').trim().slice(0, 200);
+      throw new Error(`HTTP ${res.status}: ${snippet || 'Phản hồi không phải JSON hợp lệ'}`);
+    }
+    return data;
+  }
+
   // Load backend config & verify Cloudflare Access session
   async function initConfig() {
     try {
       const res = await fetch('/api/config', { credentials: 'include' });
       if (res.ok) {
-        const cfg = await res.json();
+        const cfg = await readApiResponse(res);
         if (cfg.user && cfg.user.email) {
           authBadge.textContent = '🔒 Cloudflare Access • Ready';
         }
@@ -145,8 +191,7 @@
       progressBar.style.width = `${pct}%`;
       try {
         const res = await fetch(pollUrl, { credentials: 'include' });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Lỗi kiểm tra trạng thái dịch thuật.');
+        const data = await readApiResponse(res);
 
         if (data.status === 'completed') {
           clearInterval(pollTimer);
@@ -210,10 +255,7 @@
         body: formData,
         credentials: 'include',
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || `Lỗi máy chủ (${res.status})`);
-      }
+      const data = await readApiResponse(res);
 
       if (res.status === 202 || data.status === 'processing') {
         statusTitle.textContent = '🔄 Đang dịch hợp đồng lớn (Batch Async)...';
