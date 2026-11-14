@@ -3,9 +3,9 @@
 Merges original document bytes + Cloud Translation document bytes into 3 legal layouts:
 1. alternating    : Interleaved paragraphs/rows (Original followed immediately by Translation).
                     For vi-ko on bilingual VI+EN originals: keeps VI, overwrites EN with VI->KO.
-                    For vi-en-kr on bilingual VI+EN originals: keeps VI, uses checked/fixed EN, adds KO.
+                    For vi-en-kr on bilingual VI+EN originals: keeps VI and original EN untouched, adds KO.
 2. replace_column : Replaces target column in an existing multi-column bilingual contract
-                    (e.g., vi-ko replaces EN col with KO; vi-en-kr updates EN col + adds KO col).
+                    (e.g., vi-ko replaces EN col with KO; vi-en-kr keeps VI & EN cols + adds KO col).
 3. side_by_side   : Comparison table (2 cols for bilingual, 3 cols VI | EN | KO for trilingual).
 """
 
@@ -28,7 +28,6 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from app.en_checker import (
-    EnCheckItem,
     _table_column_languages,
     _xlsx_sheet_structure,
     detect_segment_lang_heuristic,
@@ -127,7 +126,7 @@ def build_trilingual_document(
 
 
 # =============================================================================
-# TRILINGUAL (VI + EN ORIGINAL) EXTRACTION & ASSEMBLY
+# TRILINGUAL (VI + EN ORIGINAL) ASSEMBLY
 # =============================================================================
 
 
@@ -142,152 +141,22 @@ def _classify_paragraphs_local(paragraphs: list[Paragraph]) -> list[str]:
     return res
 
 
-def extract_vi_en_pairs_for_check(original_bytes: bytes, extension: str) -> list[EnCheckItem]:
-    """Extracts matched (VI, EN) segments with deterministic pair_ids for Gemini verification."""
-    ext = extension.lower()
-    items: list[EnCheckItem] = []
-
-    if ext == ".docx":
-        doc = docx.Document(io.BytesIO(original_bytes))
-        para_langs = _classify_paragraphs_local(doc.paragraphs)
-        for b_idx, (vi_idxs, en_idxs) in enumerate(pair_paragraph_blocks(para_langs)):
-            if not vi_idxs or not en_idxs:
-                continue
-            if len(vi_idxs) == len(en_idxs):
-                for sub_idx, (v_i, e_i) in enumerate(zip(vi_idxs, en_idxs)):
-                    v_txt = doc.paragraphs[v_i].text.strip()
-                    e_txt = doc.paragraphs[e_i].text.strip()
-                    if v_txt and e_txt:
-                        items.append(EnCheckItem(pair_id=f"p:{b_idx}:{sub_idx}", vi_text=v_txt, en_text=e_txt))
-            else:
-                v_txt = "\n".join(doc.paragraphs[i].text.strip() for i in vi_idxs if doc.paragraphs[i].text.strip())
-                e_txt = "\n".join(doc.paragraphs[i].text.strip() for i in en_idxs if doc.paragraphs[i].text.strip())
-                if v_txt and e_txt:
-                    items.append(EnCheckItem(pair_id=f"p:{b_idx}:0", vi_text=v_txt, en_text=e_txt))
-
-        for t_idx, tbl in enumerate(doc.tables):
-            vi_col, en_col = _table_column_languages(tbl)
-            if vi_col is not None and en_col is not None:
-                seen_pairs: set[tuple[int, int]] = set()
-                for r_idx, row in enumerate(tbl.rows):
-                    if vi_col >= len(row.cells) or en_col >= len(row.cells):
-                        continue
-                    v_cell = row.cells[vi_col]
-                    e_cell = row.cells[en_col]
-                    if id(v_cell._tc) == id(e_cell._tc):
-                        continue
-                    pair_tc = (id(v_cell._tc), id(e_cell._tc))
-                    if pair_tc in seen_pairs:
-                        continue
-                    seen_pairs.add(pair_tc)
-                    v_txt = v_cell.text.strip()
-                    e_txt = e_cell.text.strip()
-                    v_lang = resolve_heuristic_fallback(v_txt, detect_segment_lang_heuristic(v_txt))
-                    e_lang = resolve_heuristic_fallback(e_txt, detect_segment_lang_heuristic(e_txt))
-                    if v_txt and e_txt and v_lang != "neutral" and e_lang != "neutral":
-                        items.append(EnCheckItem(pair_id=f"tbl:{t_idx}:row:{r_idx}", vi_text=v_txt, en_text=e_txt))
-            else:
-                seen_tc: set[int] = set()
-                for r_idx, row in enumerate(tbl.rows):
-                    for c_idx, cell in enumerate(row.cells):
-                        if id(cell._tc) in seen_tc:
-                            continue
-                        seen_tc.add(id(cell._tc))
-                        c_langs = _classify_paragraphs_local(cell.paragraphs)
-                        for b_idx, (vi_idxs, en_idxs) in enumerate(pair_paragraph_blocks(c_langs)):
-                            if not vi_idxs or not en_idxs:
-                                continue
-                            if len(vi_idxs) == len(en_idxs):
-                                for sub_idx, (v_i, e_i) in enumerate(zip(vi_idxs, en_idxs)):
-                                    v_txt = cell.paragraphs[v_i].text.strip()
-                                    e_txt = cell.paragraphs[e_i].text.strip()
-                                    if v_txt and e_txt:
-                                        items.append(
-                                            EnCheckItem(
-                                                pair_id=f"tbl:{t_idx}:cell:{r_idx}:{c_idx}:{b_idx}:{sub_idx}",
-                                                vi_text=v_txt,
-                                                en_text=e_txt,
-                                            )
-                                        )
-                            else:
-                                v_txt = "\n".join(cell.paragraphs[i].text.strip() for i in vi_idxs if cell.paragraphs[i].text.strip())
-                                e_txt = "\n".join(cell.paragraphs[i].text.strip() for i in en_idxs if cell.paragraphs[i].text.strip())
-                                if v_txt and e_txt:
-                                    items.append(
-                                        EnCheckItem(
-                                            pair_id=f"tbl:{t_idx}:cell:{r_idx}:{c_idx}:{b_idx}:0",
-                                            vi_text=v_txt,
-                                            en_text=e_txt,
-                                        )
-                                    )
-
-    elif ext == ".xlsx":
-        wb = openpyxl.load_workbook(io.BytesIO(original_bytes), read_only=True, data_only=True)
-        try:
-            for s_idx, ws in enumerate(wb.worksheets):
-                col_pair, row_langs = _xlsx_sheet_structure(ws)
-                if col_pair is not None:
-                    vi_c, en_c = col_pair
-                    for r in range(1, (ws.max_row or 0) + 1):
-                        v_s = str(ws.cell(row=r, column=vi_c).value or "").strip()
-                        e_s = str(ws.cell(row=r, column=en_c).value or "").strip()
-                        if v_s and e_s:
-                            v_l = resolve_heuristic_fallback(v_s, detect_segment_lang_heuristic(v_s))
-                            e_l = resolve_heuristic_fallback(e_s, detect_segment_lang_heuristic(e_s))
-                            if v_l != "neutral" and e_l != "neutral":
-                                items.append(EnCheckItem(pair_id=f"ws:{s_idx}:colrow:{r}", vi_text=v_s, en_text=e_s))
-                else:
-                    for b_idx, (vi_idxs, en_idxs) in enumerate(pair_paragraph_blocks(row_langs)):
-                        if not vi_idxs or not en_idxs:
-                            continue
-                        for sub_idx, (v_i, e_i) in enumerate(zip(vi_idxs, en_idxs)):
-                            v_r = v_i + 1
-                            e_r = e_i + 1
-                            max_c = ws.max_column or 1
-                            v_s = " | ".join(
-                                str(ws.cell(row=v_r, column=c).value).strip()
-                                for c in range(1, max_c + 1)
-                                if ws.cell(row=v_r, column=c).value is not None
-                                and str(ws.cell(row=v_r, column=c).value).strip()
-                            )
-                            e_s = " | ".join(
-                                str(ws.cell(row=e_r, column=c).value).strip()
-                                for c in range(1, max_c + 1)
-                                if ws.cell(row=e_r, column=c).value is not None
-                                and str(ws.cell(row=e_r, column=c).value).strip()
-                            )
-                            if v_s and e_s:
-                                items.append(
-                                    EnCheckItem(
-                                        pair_id=f"ws:{s_idx}:rowblk:{b_idx}:{sub_idx}",
-                                        vi_text=v_s,
-                                        en_text=e_s,
-                                    )
-                                )
-        finally:
-            wb.close()
-
-    return items
-
-
 def build_trilingual_from_bilingual_document(
     original_bytes: bytes,
     translated_ko_bytes: bytes,
-    corrected_en_map: dict[str, str],
     extension: str,
     layout_mode: str,
     translated_en_bytes: Optional[bytes] = None,
     source_lang: str = "vi",
     replace_col_index: int = 1,
 ) -> bytes:
-    """Assembles VI / EN (checked & fixed) / KO from a bilingual VI+EN original."""
+    """Assembles VI / EN (original untouched) / KO from a bilingual VI+EN original."""
     ext = extension.lower()
     if ext == ".docx":
         if layout_mode == "side_by_side":
             out_doc = _docx_trilingual_from_bilingual_side_by_side(
                 original_bytes=original_bytes,
                 translated_ko_bytes=translated_ko_bytes,
-                corrected_en_map=corrected_en_map,
                 translated_en_bytes=translated_en_bytes,
                 source_lang=source_lang,
             )
@@ -295,7 +164,6 @@ def build_trilingual_from_bilingual_document(
             out_doc = _docx_trilingual_from_bilingual_in_place(
                 original_bytes=original_bytes,
                 translated_ko_bytes=translated_ko_bytes,
-                corrected_en_map=corrected_en_map,
                 translated_en_bytes=translated_en_bytes,
                 layout_mode=layout_mode,
                 replace_col_index=replace_col_index,
@@ -310,7 +178,6 @@ def build_trilingual_from_bilingual_document(
         return _build_trilingual_from_bilingual_xlsx(
             original_bytes=original_bytes,
             translated_ko_bytes=translated_ko_bytes,
-            corrected_en_map=corrected_en_map,
             translated_en_bytes=translated_en_bytes,
             layout_mode=layout_mode,
             source_lang=source_lang,
@@ -1167,19 +1034,18 @@ def _docx_trilingual_alternating(
 
 
 # =============================================================================
-# TRILINGUAL (VI + EN BILINGUAL ORIGINAL -> VI / EN(fixed) / KO) BUILDERS
+# TRILINGUAL (VI + EN BILINGUAL ORIGINAL -> VI / EN(original) / KO) BUILDERS
 # =============================================================================
 
 
 def _docx_trilingual_from_bilingual_in_place(
     original_bytes: bytes,
     translated_ko_bytes: bytes,
-    corrected_en_map: dict[str, str],
     translated_en_bytes: Optional[bytes] = None,
     layout_mode: str = "alternating",
     replace_col_index: int = 1,
 ) -> DocxDocument:
-    """Keeps VI, updates EN with checked/corrected EN, and adds KO (VI->KO) for alternating & replace_column."""
+    """Keeps VI and original EN untouched, and adds KO (VI->KO) for alternating & replace_column."""
     orig_doc = docx.Document(io.BytesIO(original_bytes))
     ko_doc = docx.Document(io.BytesIO(translated_ko_bytes))
     en_trans_doc = docx.Document(io.BytesIO(translated_en_bytes)) if translated_en_bytes else None
@@ -1192,19 +1058,15 @@ def _docx_trilingual_from_bilingual_in_place(
         if en_trans_doc is not None:
             return _docx_trilingual_side_by_side(original_bytes, translated_en_bytes, translated_ko_bytes, "vi")
 
-    for b_idx, (vi_idxs, en_idxs) in reversed(list(enumerate(blocks))):
+    for vi_idxs, en_idxs in reversed(blocks):
         if vi_idxs and en_idxs:
             leading_en = en_idxs[0] < vi_idxs[0]
             if len(vi_idxs) == len(en_idxs) and not leading_en:
-                for sub_idx, (v_i, e_i) in reversed(list(enumerate(zip(vi_idxs, en_idxs)))):
-                    pid = f"p:{b_idx}:{sub_idx}"
+                for v_i, e_i in reversed(list(zip(vi_idxs, en_idxs))):
                     e_p = orig_doc.paragraphs[e_i]
-                    if pid in corrected_en_map and corrected_en_map[pid] != e_p.text.strip():
-                        _replace_paragraph_text(e_p, corrected_en_map[pid], override_color=_EN_ACCENT_COLOR)
-                    else:
-                        for r in e_p.runs:
-                            if not r.font.color or not r.font.color.rgb:
-                                r.font.color.rgb = _EN_ACCENT_COLOR
+                    for r in e_p.runs:
+                        if not r.font.color or not r.font.color.rgb:
+                            r.font.color.rgb = _EN_ACCENT_COLOR
                     e_p.paragraph_format.space_after = Pt(2)
                     t_ko = ko_doc.paragraphs[v_i] if v_i < len(ko_doc.paragraphs) else None
                     if t_ko is not None and t_ko.text.strip():
@@ -1212,26 +1074,24 @@ def _docx_trilingual_from_bilingual_in_place(
                         ins_ko.paragraph_format.left_indent = Cm(0.5)
                         ins_ko.paragraph_format.space_after = Pt(6)
                         _copy_runs_with_basic_style(t_ko, ins_ko, override_color=_KO_ACCENT_COLOR)
-            elif len(vi_idxs) == 1 and not leading_en:
-                v_i = vi_idxs[0]
-                pid = f"p:{b_idx}:0"
-                first_e = orig_doc.paragraphs[en_idxs[0]]
-                for extra_e in reversed(en_idxs[1:]):
-                    _remove_paragraph(orig_doc.paragraphs[extra_e])
-                if pid in corrected_en_map and corrected_en_map[pid] != first_e.text.strip():
-                    _replace_paragraph_text(first_e, corrected_en_map[pid], override_color=_EN_ACCENT_COLOR)
-                first_e.paragraph_format.space_after = Pt(2)
-                t_ko = ko_doc.paragraphs[v_i] if v_i < len(ko_doc.paragraphs) else None
-                if t_ko is not None and t_ko.text.strip():
-                    ins_ko = _insert_paragraph_after(first_e)
+            elif not leading_en:
+                # Keep all original EN paragraphs untouched; append KO after the last EN paragraph
+                last_e = orig_doc.paragraphs[en_idxs[-1]]
+                last_e.paragraph_format.space_after = Pt(2)
+                ko_joined = "\n".join(
+                    ko_doc.paragraphs[v_i].text.strip()
+                    for v_i in vi_idxs
+                    if v_i < len(ko_doc.paragraphs) and ko_doc.paragraphs[v_i].text.strip()
+                )
+                if ko_joined:
+                    ins_ko = _insert_paragraph_after(last_e, ko_joined)
                     ins_ko.paragraph_format.left_indent = Cm(0.5)
                     ins_ko.paragraph_format.space_after = Pt(6)
-                    _copy_runs_with_basic_style(t_ko, ins_ko, override_color=_KO_ACCENT_COLOR)
+                    for r in ins_ko.runs:
+                        r.font.color.rgb = _KO_ACCENT_COLOR
             else:
-                # Multi-paragraph block or leading EN before VI: normalize to VI -> EN(checked) -> KO
-                pid = f"p:{b_idx}:0"
+                # Leading EN before VI: normalize order to VI -> EN (original) -> KO
                 orig_en_joined = "\n".join(orig_doc.paragraphs[e].text.strip() for e in en_idxs if orig_doc.paragraphs[e].text.strip())
-                final_en = corrected_en_map.get(pid, orig_en_joined)
                 for e_i in reversed(en_idxs):
                     _remove_paragraph(orig_doc.paragraphs[e_i])
                 last_v = orig_doc.paragraphs[vi_idxs[-1]]
@@ -1246,8 +1106,8 @@ def _docx_trilingual_from_bilingual_in_place(
                     ins_ko.paragraph_format.space_after = Pt(6)
                     for r in ins_ko.runs:
                         r.font.color.rgb = _KO_ACCENT_COLOR
-                if final_en:
-                    ins_en = _insert_paragraph_after(last_v, final_en)
+                if orig_en_joined:
+                    ins_en = _insert_paragraph_after(last_v, orig_en_joined)
                     ins_en.paragraph_format.left_indent = Cm(0.5)
                     ins_en.paragraph_format.space_after = Pt(2)
                     for r in ins_en.runs:
@@ -1271,21 +1131,11 @@ def _docx_trilingual_from_bilingual_in_place(
 
     # Tables
     for t_idx, (orig_tbl, ko_tbl) in enumerate(zip(orig_doc.tables, ko_doc.tables)):
-        vi_col, en_col = _table_column_languages(orig_tbl)
+        vi_col, _en_col = _table_column_languages(orig_tbl)
         en_trans_tbl = en_trans_doc.tables[t_idx] if (en_trans_doc and t_idx < len(en_trans_doc.tables)) else None
-        if vi_col is not None and en_col is not None:
-            target_en_col = en_col
-            seen_en_tc: set[int] = set()
+        if vi_col is not None and _en_col is not None:
             ko_cells_by_row: list[Optional[docx.table._Cell]] = []
-            for r_idx, (o_row, k_row) in enumerate(zip(orig_tbl.rows, ko_tbl.rows)):
-                if vi_col < len(o_row.cells) and target_en_col < len(o_row.cells):
-                    v_cell = o_row.cells[vi_col]
-                    e_cell = o_row.cells[target_en_col]
-                    if id(v_cell._tc) != id(e_cell._tc) and id(e_cell._tc) not in seen_en_tc:
-                        seen_en_tc.add(id(e_cell._tc))
-                        pid = f"tbl:{t_idx}:row:{r_idx}"
-                        if pid in corrected_en_map and corrected_en_map[pid] != e_cell.text.strip():
-                            _set_cell_text_preserve_first(e_cell, corrected_en_map[pid], override_color=_EN_ACCENT_COLOR)
+            for k_row in ko_tbl.rows:
                 ko_cell = k_row.cells[vi_col] if vi_col < len(k_row.cells) else (k_row.cells[0] if k_row.cells else None)
                 ko_cells_by_row.append(ko_cell)
             _append_column_to_table(orig_tbl, ko_cells_by_row)
@@ -1300,22 +1150,28 @@ def _docx_trilingual_from_bilingual_in_place(
                     c_blocks = pair_paragraph_blocks(c_langs)
                     has_cell_en = any(e for _, e in c_blocks)
                     if has_cell_en:
-                        for b_idx, (vi_idxs, en_idxs) in reversed(list(enumerate(c_blocks))):
+                        for vi_idxs, en_idxs in reversed(c_blocks):
                             if vi_idxs and en_idxs:
                                 if len(vi_idxs) == len(en_idxs) and en_idxs[0] > vi_idxs[0]:
-                                    for sub_idx, (v_i, e_i) in reversed(list(enumerate(zip(vi_idxs, en_idxs)))):
-                                        pid = f"tbl:{t_idx}:cell:{r_idx}:{c_idx}:{b_idx}:{sub_idx}"
+                                    for v_i, e_i in reversed(list(zip(vi_idxs, en_idxs))):
                                         e_p = o_cell.paragraphs[e_i]
-                                        if pid in corrected_en_map and corrected_en_map[pid] != e_p.text.strip():
-                                            _replace_paragraph_text(e_p, corrected_en_map[pid], override_color=_EN_ACCENT_COLOR)
                                         t_ko = k_cell.paragraphs[v_i] if v_i < len(k_cell.paragraphs) else None
                                         if t_ko is not None and t_ko.text.strip():
                                             ins_ko = _insert_paragraph_after(e_p)
                                             _copy_runs_with_basic_style(t_ko, ins_ko, override_color=_KO_ACCENT_COLOR)
+                                elif en_idxs[0] > vi_idxs[0]:
+                                    last_e = o_cell.paragraphs[en_idxs[-1]]
+                                    ko_joined = "\n".join(
+                                        k_cell.paragraphs[v_i].text.strip()
+                                        for v_i in vi_idxs
+                                        if v_i < len(k_cell.paragraphs) and k_cell.paragraphs[v_i].text.strip()
+                                    )
+                                    if ko_joined:
+                                        ins_ko = _insert_paragraph_after(last_e, ko_joined)
+                                        for r in ins_ko.runs:
+                                            r.font.color.rgb = _KO_ACCENT_COLOR
                                 else:
-                                    pid = f"tbl:{t_idx}:cell:{r_idx}:{c_idx}:{b_idx}:0"
                                     orig_en_joined = "\n".join(o_cell.paragraphs[e].text.strip() for e in en_idxs if o_cell.paragraphs[e].text.strip())
-                                    final_en = corrected_en_map.get(pid, orig_en_joined)
                                     for e_i in reversed(en_idxs):
                                         _remove_paragraph(o_cell.paragraphs[e_i])
                                     last_v = o_cell.paragraphs[vi_idxs[-1]]
@@ -1328,8 +1184,8 @@ def _docx_trilingual_from_bilingual_in_place(
                                         ins_ko = _insert_paragraph_after(last_v, ko_joined)
                                         for r in ins_ko.runs:
                                             r.font.color.rgb = _KO_ACCENT_COLOR
-                                    if final_en:
-                                        ins_en = _insert_paragraph_after(last_v, final_en)
+                                    if orig_en_joined:
+                                        ins_en = _insert_paragraph_after(last_v, orig_en_joined)
                                         for r in ins_en.runs:
                                             r.font.color.rgb = _EN_ACCENT_COLOR
                     else:
@@ -1354,11 +1210,10 @@ def _docx_trilingual_from_bilingual_in_place(
 def _docx_trilingual_from_bilingual_side_by_side(
     original_bytes: bytes,
     translated_ko_bytes: bytes,
-    corrected_en_map: dict[str, str],
     translated_en_bytes: Optional[bytes] = None,
     source_lang: str = "vi",
 ) -> DocxDocument:
-    """Builds a 3-column comparison table (VI | EN(checked/fixed) | KO) from a bilingual VI+EN doc."""
+    """Builds a 3-column comparison table (VI | EN(original) | KO) from a bilingual VI+EN doc."""
     orig_doc = docx.Document(io.BytesIO(original_bytes))
     ko_doc = docx.Document(io.BytesIO(translated_ko_bytes))
     en_trans_doc = docx.Document(io.BytesIO(translated_en_bytes)) if translated_en_bytes else None
@@ -1409,17 +1264,14 @@ def _docx_trilingual_from_bilingual_side_by_side(
         rows_list: list[tuple[str, str, str]] = []
         if vi_idxs and en_idxs:
             if len(vi_idxs) == len(en_idxs):
-                for sub_idx, (v_i, e_i) in enumerate(zip(vi_idxs, en_idxs)):
-                    pid = f"p:{b_idx}:{sub_idx}"
+                for v_i, e_i in zip(vi_idxs, en_idxs):
                     v_txt = orig_doc.paragraphs[v_i].text.strip()
-                    e_txt = corrected_en_map.get(pid, orig_doc.paragraphs[e_i].text.strip())
+                    e_txt = orig_doc.paragraphs[e_i].text.strip()
                     k_txt = ko_doc.paragraphs[v_i].text.strip() if v_i < len(ko_doc.paragraphs) else ""
                     rows_list.append((v_txt, e_txt, k_txt))
             else:
-                pid = f"p:{b_idx}:0"
                 v_txt = "\n".join(orig_doc.paragraphs[i].text.strip() for i in vi_idxs if orig_doc.paragraphs[i].text.strip())
-                e_orig = "\n".join(orig_doc.paragraphs[i].text.strip() for i in en_idxs if orig_doc.paragraphs[i].text.strip())
-                e_txt = corrected_en_map.get(pid, e_orig)
+                e_txt = "\n".join(orig_doc.paragraphs[i].text.strip() for i in en_idxs if orig_doc.paragraphs[i].text.strip())
                 k_txt = "\n".join(
                     ko_doc.paragraphs[i].text.strip()
                     for i in vi_idxs
@@ -1478,8 +1330,7 @@ def _docx_trilingual_from_bilingual_side_by_side(
                         continue
                     seen_pairs.add((id(v_cell._tc), id(e_cell._tc)))
                     v_txt = v_cell.text.strip()
-                    pid = f"tbl:{t_idx}:row:{r_idx}"
-                    e_txt = corrected_en_map.get(pid, e_cell.text.strip())
+                    e_txt = e_cell.text.strip()
                     k_txt = ""
                     if ko_tbl and r_idx < len(ko_tbl.rows) and vi_col < len(ko_tbl.rows[r_idx].cells):
                         k_txt = ko_tbl.rows[r_idx].cells[vi_col].text.strip()
@@ -1600,13 +1451,12 @@ def _build_trilingual_xlsx(
 def _build_trilingual_from_bilingual_xlsx(
     original_bytes: bytes,
     translated_ko_bytes: bytes,
-    corrected_en_map: dict[str, str],
     translated_en_bytes: Optional[bytes] = None,
     layout_mode: str = "alternating",
     source_lang: str = "vi",
     replace_col_index: int = 1,
 ) -> bytes:
-    """Assembles VI / EN(checked) / KO Excel workbook from a bilingual VI+EN original."""
+    """Assembles VI / EN(original) / KO Excel workbook from a bilingual VI+EN original."""
     orig_wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
     ko_wb = openpyxl.load_workbook(io.BytesIO(translated_ko_bytes))
     en_wb = openpyxl.load_workbook(io.BytesIO(translated_en_bytes)) if translated_en_bytes else None
@@ -1635,12 +1485,11 @@ def _build_trilingual_from_bilingual_xlsx(
                     ws.column_dimensions[get_column_letter(col_idx)].width = 28
                 for r in range(1, max_r + 1):
                     dst_r = r + 1
-                    pid = f"ws:{s_idx}:colrow:{r}"
                     v_cell = o_ws.cell(row=r, column=vi_c)
                     e_cell = o_ws.cell(row=r, column=en_c)
                     k_cell = k_ws.cell(row=r, column=vi_c)
                     d1 = ws.cell(row=dst_r, column=1, value=v_cell.value)
-                    d2 = ws.cell(row=dst_r, column=2, value=corrected_en_map.get(pid, e_cell.value))
+                    d2 = ws.cell(row=dst_r, column=2, value=e_cell.value)
                     d3 = ws.cell(row=dst_r, column=3, value=k_cell.value)
                     _copy_cell_style(v_cell, d1)
                     _copy_cell_style(e_cell, d2)
@@ -1648,18 +1497,14 @@ def _build_trilingual_from_bilingual_xlsx(
                     for d in (d1, d2, d3):
                         d.alignment = Alignment(wrap_text=True, vertical="top")
             else:
-                # Keep original columns, update EN column with checked EN, insert KO column right after EN
+                # Keep original VI & EN columns untouched, insert KO column right after EN
                 ko_insert_c = en_c + 1
                 for r in range(1, max_r + 1):
-                    pid = f"ws:{s_idx}:colrow:{r}"
                     for c in range(1, max_c + 1):
                         dst_c = c if c < ko_insert_c else c + 1
                         o_cell = o_ws.cell(row=r, column=c)
-                        val = corrected_en_map.get(pid, o_cell.value) if c == en_c else o_cell.value
-                        d_cell = ws.cell(row=r, column=dst_c, value=val)
+                        d_cell = ws.cell(row=r, column=dst_c, value=o_cell.value)
                         _copy_cell_style(o_cell, d_cell)
-                        if c == en_c and pid in corrected_en_map and corrected_en_map[pid] != str(o_cell.value or "").strip():
-                            d_cell.fill = en_fill
                         d_cell.alignment = Alignment(wrap_text=True, vertical="top")
                     k_cell = k_ws.cell(row=r, column=vi_c)
                     d_ko = ws.cell(row=r, column=ko_insert_c, value=k_cell.value)
@@ -1676,16 +1521,14 @@ def _build_trilingual_from_bilingual_xlsx(
                         hc.fill, hc.font = hdr_fill, hdr_font
                         ws.column_dimensions[get_column_letter(base_col + offset)].width = 24
                 dst_r = 2
-                for b_idx, (vi_idxs, en_idxs) in enumerate(blocks):
+                for vi_idxs, en_idxs in blocks:
                     for sub_idx, v_i in enumerate(vi_idxs):
                         v_r = v_i + 1
                         e_r = en_idxs[sub_idx] + 1 if sub_idx < len(en_idxs) else None
-                        pid = f"ws:{s_idx}:rowblk:{b_idx}:{sub_idx}"
-                        e_override = corrected_en_map.get(pid)
                         for c in range(1, max_c + 1):
                             base_col = (c - 1) * 3 + 1
                             v_val = o_ws.cell(row=v_r, column=c).value
-                            e_val = e_override if (e_override and c == 1) else (o_ws.cell(row=e_r, column=c).value if e_r else (e_ws.cell(row=v_r, column=c).value if e_ws else ""))
+                            e_val = o_ws.cell(row=e_r, column=c).value if e_r else (e_ws.cell(row=v_r, column=c).value if e_ws else "")
                             k_val = k_ws.cell(row=v_r, column=c).value
                             ws.cell(row=dst_r, column=base_col, value=v_val)
                             ws.cell(row=dst_r, column=base_col + 1, value=e_val)
@@ -1693,21 +1536,19 @@ def _build_trilingual_from_bilingual_xlsx(
                         dst_r += 1
             else:
                 dst_r = 1
-                for b_idx, (vi_idxs, en_idxs) in enumerate(blocks):
+                for vi_idxs, en_idxs in blocks:
                     for sub_idx, v_i in enumerate(vi_idxs):
                         v_r = v_i + 1
                         e_r = en_idxs[sub_idx] + 1 if sub_idx < len(en_idxs) else None
-                        pid = f"ws:{s_idx}:rowblk:{b_idx}:{sub_idx}"
-                        e_override = corrected_en_map.get(pid)
                         for c in range(1, max_c + 1):
                             o_cell = o_ws.cell(row=v_r, column=c)
                             d_v = ws.cell(row=dst_r, column=c, value=o_cell.value)
                             _copy_cell_style(o_cell, d_v)
                         dst_r += 1
-                        if e_r is not None or e_override or e_ws is not None:
+                        if e_r is not None or e_ws is not None:
                             for c in range(1, max_c + 1):
                                 src_c = o_ws.cell(row=e_r, column=c) if e_r else (e_ws.cell(row=v_r, column=c) if e_ws else None)
-                                val = e_override if (e_override and max_c == 1) else (src_c.value if src_c else "")
+                                val = src_c.value if src_c else ""
                                 d_e = ws.cell(row=dst_r, column=c, value=val)
                                 if src_c:
                                     _copy_cell_style(src_c, d_e)

@@ -30,10 +30,9 @@ from app.bilingual_layout import (
     build_bilingual_document,
     build_trilingual_document,
     build_trilingual_from_bilingual_document,
-    extract_vi_en_pairs_for_check,
 )
 from app.dlp_service import get_dlp_service
-from app.en_checker import EnCheckBatchResult, get_en_checker_service
+from app.en_checker import get_en_checker_service
 from app.key_rotator import get_project_rotator
 from app.legal_review import LegalReviewResult, get_legal_review_service
 from app.translation_service import (
@@ -131,12 +130,12 @@ async def get_app_config(
             {
                 "id": "alternating",
                 "label": "Đoạn văn xen kẽ (Alternating)",
-                "description": "Đoạn gốc theo sau bởi bản dịch. Nếu gốc có VI+EN: vi-ko đè EN thành KR; vi-en-kr kiểm/sửa EN rồi thêm KR (Mặc định).",
+                "description": "Đoạn gốc theo sau bởi bản dịch. Nếu gốc có VI+EN: vi-ko đè EN thành KR; vi-en-kr giữ nguyên EN gốc và thêm KR (Mặc định).",
             },
             {
                 "id": "replace_column",
                 "label": "Thay thế ngôn ngữ (Replace Column)",
-                "description": "Ghi đè cột EN thành KR (vi-ko), hoặc kiểm/sửa cột EN và thêm cột KR (vi-en-kr).",
+                "description": "Ghi đè cột EN thành KR (vi-ko), hoặc giữ nguyên cột EN gốc và thêm cột KR (vi-en-kr).",
             },
             {
                 "id": "side_by_side",
@@ -223,15 +222,11 @@ async def translate_contract(
     original_has_en: Optional[bool] = None
     unmatched_vi_count = 0
     if is_trilingual:
-        lang_summary = await en_checker.inspect_document_languages(
-            working_bytes, working_ext, allow_gemini=True
-        )
+        lang_summary = await en_checker.inspect_document_languages(working_bytes, working_ext)
         original_has_en = lang_summary.has_vi_and_en
         unmatched_vi_count = lang_summary.unmatched_vi_count
     elif src == "vi" and tgt == "ko" and layout_mode == "alternating":
-        lang_summary = await en_checker.inspect_document_languages(
-            working_bytes, working_ext, allow_gemini=False
-        )
+        lang_summary = await en_checker.inspect_document_languages(working_bytes, working_ext)
         original_has_en = lang_summary.has_vi_and_en
 
     output_filename = _safe_output_filename(raw_filename, src, tgt, layout_mode)
@@ -357,7 +352,6 @@ async def translate_contract(
         )
 
     # 2B. SYNC FLOW (<= 15 pages AND <= 20,000 chars)
-    en_check_res: Optional[EnCheckBatchResult] = None
     if is_trilingual:
         translated_ko_bytes, project_used = translation_svc.translate_sync(
             session_id=job_id,
@@ -380,12 +374,9 @@ async def translate_contract(
             )
 
         if original_has_en:
-            vi_en_pairs = extract_vi_en_pairs_for_check(working_bytes, working_ext)
-            en_check_res = await en_checker.verify_and_fix_en_batch(vi_en_pairs)
             final_bytes = build_trilingual_from_bilingual_document(
                 original_bytes=working_bytes,
                 translated_ko_bytes=translated_ko_bytes,
-                corrected_en_map=en_check_res.corrected_map,
                 extension=working_ext,
                 layout_mode=layout_mode,
                 translated_en_bytes=translated_en_bytes,
@@ -464,7 +455,6 @@ async def translate_contract(
         "project_id": project_used,
         "metrics": metrics.model_dump(),
         "legal_review": legal_result.model_dump() if legal_result else None,
-        "en_check": en_check_res.stats.model_dump() if en_check_res else None,
     }
     translation_svc.save_job_state(job_id=job_id, state=completed_state)
 
@@ -490,7 +480,6 @@ async def translate_contract(
             "download_url": f"/api/jobs/{job_id}/download",
             "metrics": metrics.model_dump(),
             "legal_review": legal_result.model_dump() if legal_result else None,
-            "en_check": en_check_res.stats.model_dump() if en_check_res else None,
         },
     )
 
@@ -522,12 +511,10 @@ async def get_job_status(
             "download_url": f"/api/jobs/{job_id}/download" if state["status"] == "completed" else None,
             "metrics": state.get("metrics"),
             "legal_review": state.get("legal_review"),
-            "en_check": state.get("en_check"),
         }
 
     # Poll Google Cloud Translation LRO operation(s)
     batch_meta = state["batch_meta"]
-    en_check_res: Optional[EnCheckBatchResult] = None
     if batch_meta.get("multi_target"):
         targets_meta = batch_meta["targets"]
         check_ko = translation_svc.check_batch_operation(targets_meta["ko"])
@@ -562,13 +549,9 @@ async def get_job_status(
         translated_en_bytes = check_en["translated_bytes"]
         translated_ko_bytes = check_ko["translated_bytes"]
         if state.get("original_has_en"):
-            en_checker = get_en_checker_service()
-            vi_en_pairs = extract_vi_en_pairs_for_check(original_bytes, state["extension"])
-            en_check_res = await en_checker.verify_and_fix_en_batch(vi_en_pairs)
             final_bytes = build_trilingual_from_bilingual_document(
                 original_bytes=original_bytes,
                 translated_ko_bytes=translated_ko_bytes,
-                corrected_en_map=en_check_res.corrected_map,
                 extension=state["extension"],
                 layout_mode=state["layout_mode"],
                 translated_en_bytes=translated_en_bytes,
@@ -648,7 +631,6 @@ async def get_job_status(
     state["completed_at"] = int(time.time())
     state["final_ref"] = final_ref
     state["legal_review"] = legal_result.model_dump() if legal_result else None
-    state["en_check"] = en_check_res.stats.model_dump() if en_check_res else None
     translation_svc.save_job_state(job_id=job_id, state=state)
 
     dlp.save_redacted_audit_log(
@@ -669,7 +651,6 @@ async def get_job_status(
         "download_url": f"/api/jobs/{job_id}/download",
         "metrics": state.get("metrics"),
         "legal_review": state["legal_review"],
-        "en_check": state["en_check"],
     }
 
 

@@ -1,29 +1,23 @@
-"""Language Detection & Gemini EN-vs-VI Verification Service.
+"""Heuristic VI / EN / KO Language Detection Service (zero LLM/API calls).
 
 Used for:
-1. Cheap per-paragraph / per-cell / per-column language detection (character/stopword
-   heuristics first, optional batched Gemini disambiguation only for ambiguous segments).
-2. For `vi-en-kr` on bilingual VI+EN originals ONLY:
-   Batched Gemini verification (1 call per batch) comparing existing EN against VI.
-   Accurate EN is kept untouched; inaccurate/mismatched EN is corrected.
+1. Zero-cost per-paragraph / per-cell / per-column language detection using
+   character and stopword heuristics.
+2. Detecting whether a .docx or .xlsx contract already contains both VI and EN
+   so that:
+   - `vi-ko` can keep VI and overwrite EN with VI->KO.
+   - `vi-en-kr` can keep original VI and EN untouched and append VI->KO.
 """
 
 from __future__ import annotations
 
 import io
-import json
-import logging
-import os
 import re
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 
 import docx
 import openpyxl
-from pydantic import BaseModel, Field
-
-from app.key_rotator import get_project_rotator
-
-logger = logging.getLogger(__name__)
+from pydantic import BaseModel
 
 LangCode = Literal["vi", "en", "ko", "neutral", "unknown"]
 
@@ -66,18 +60,6 @@ _VI_STOPWORDS = frozenset({
     "dieu", "khoan", "hop", "dong", "ben", "cua", "khong", "duoc", "phai",
     "thanh", "toan", "ngay", "thang", "nam", "cong", "ty",
 })
-
-EN_CHECK_SYSTEM_PROMPT = """You are a senior Vietnamese-English legal contract auditor.
-Compare each English translation ("en") against its authoritative Vietnamese clause ("vi").
-Rules:
-1. Check legal meaning, numbers, percentages, currencies, dates, deadlines, party roles (Party A/B), obligations ("shall/must" vs "may"), and omissions/additions.
-2. If "en" accurately conveys "vi" (minor stylistic differences in valid legal English are fine), set "is_accurate": true and OMIT "corrected_en".
-3. If "en" has ANY factual/legal/numeric/meaning error or is missing/mistranslated (or empty), set "is_accurate": false and provide "corrected_en" as an accurate, formal legal English translation of "vi".
-4. Return ONLY valid JSON matching:
-{"results": [{"id": "0", "is_accurate": true}, {"id": "1", "is_accurate": false, "corrected_en": "..."}]}"""
-
-LANG_DETECT_SYSTEM_PROMPT = """Classify each numbered text snippet as one of: "vi" (Vietnamese), "en" (English), "ko" (Korean), or "neutral" (numbers, codes, symbols, proper names without sentence).
-Return ONLY valid JSON: {"labels": {"0": "vi", "1": "en"}}"""
 
 
 def detect_segment_lang_heuristic(text: str) -> LangCode:
@@ -142,26 +124,6 @@ def resolve_heuristic_fallback(text: str, lang: LangCode) -> Literal["vi", "en",
     return "neutral"
 
 
-class EnCheckItem(BaseModel):
-    pair_id: str
-    vi_text: str
-    en_text: str
-
-
-class EnCheckStats(BaseModel):
-    enabled: bool = False
-    checked_count: int = 0
-    corrected_count: int = 0
-    gemini_calls: int = 0
-    model: str = ""
-    status: str = "not_applicable"  # not_applicable | ok | skipped_unavailable | partial_error
-
-
-class EnCheckBatchResult(BaseModel):
-    corrected_map: dict[str, str] = Field(default_factory=dict)
-    stats: EnCheckStats = Field(default_factory=EnCheckStats)
-
-
 class DocumentLangSummary(BaseModel):
     has_vi_and_en: bool = False
     vi_count: int = 0
@@ -169,19 +131,6 @@ class DocumentLangSummary(BaseModel):
     paired_vi_en_count: int = 0
     unmatched_vi_count: int = 0
     bilingual_tables_count: int = 0
-
-
-def _parse_json_obj(raw_text: str) -> dict[str, Any]:
-    cleaned = (raw_text or "").strip()
-    fence = "\x60\x60\x60"
-    if cleaned.startswith(fence):
-        cleaned = re.sub(r"^\x60{3}(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*\x60{3}$", "", cleaned)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        cleaned = cleaned[start : end + 1]
-    return json.loads(cleaned)
 
 
 def _table_column_languages(
@@ -334,116 +283,23 @@ def pair_paragraph_blocks(langs: list[str]) -> list[tuple[list[int], list[int]]]
 
 
 class EnCheckerService:
-    """Provides cheap language detection and batched Gemini EN-vs-VI verification."""
+    """Provides purely heuristic VI/EN/KO language detection for contract layout routing."""
 
-    def __init__(self) -> None:
-        self._model = os.getenv("GEMINI_EN_CHECK_MODEL", "gemini-2.5-flash").strip()
-        self._batch_size = max(1, int(os.getenv("EN_CHECK_BATCH_SIZE", "35")))
-        self._batch_max_chars = max(2000, int(os.getenv("EN_CHECK_BATCH_MAX_CHARS", "12000")))
-
-    def _build_genai_client(self) -> Optional[Any]:
-        """Creates a google-genai client using GEMINI_API_KEY or Vertex AI ADC."""
-        try:
-            from google import genai
-        except ImportError:
-            logger.warning("google-genai package is not installed; Gemini EN check unavailable.")
-            return None
-
-        gemini_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-        if gemini_key:
-            return genai.Client(api_key=gemini_key)
-
-        project_id = (
-            os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-            or os.getenv("GCP_PROJECT_ID", "").strip()
-        )
-        if not project_id:
-            try:
-                summary = get_project_rotator().get_pool_summary()
-                if summary:
-                    project_id = str(summary[0].get("project_id", "")).strip()
-            except Exception:
-                project_id = ""
-
-        if project_id:
-            location = os.getenv("VERTEX_AI_LOCATION", "us-central1").strip()
-            try:
-                return genai.Client(vertexai=True, project=project_id, location=location)
-            except Exception as exc:
-                logger.warning("Failed to init Vertex AI GenAI client (%s).", type(exc).__name__)
-                return None
-
-        return None
-
-    async def _call_gemini_json(self, system_instruction: str, user_payload: str) -> dict[str, Any]:
-        """Invokes Gemini with JSON output. Separated cleanly for unit-test mocking."""
-        client = self._build_genai_client()
-        if client is None:
-            raise RuntimeError("No GEMINI_API_KEY or Vertex AI project configured for Gemini.")
-
-        from google.genai import types
-
-        resp = await client.aio.models.generate_content(
-            model=self._model,
-            contents=user_payload,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
-        return _parse_json_obj(resp.text or "{}")
-
-    async def classify_texts(self, texts: list[str], allow_gemini: bool = True) -> list[str]:
-        """Classifies texts cheaply with heuristics; uses 1 Gemini batch only for ambiguous items."""
-        raw_langs = [detect_segment_lang_heuristic(t) for t in texts]
-        unknown_unique: list[str] = []
-        seen: set[str] = set()
-        for t, lang in zip(texts, raw_langs):
-            if lang == "unknown":
-                s = t.strip()
-                if s and s not in seen:
-                    seen.add(s)
-                    unknown_unique.append(s)
-
-        gemini_labels: dict[str, str] = {}
-        if allow_gemini and unknown_unique:
-            # Cap unknown batch to avoid unnecessary cost
-            sample = unknown_unique[:60]
-            payload = json.dumps(
-                {"items": [{"id": str(idx), "text": txt[:400]} for idx, txt in enumerate(sample)]},
-                ensure_ascii=False,
-            )
-            try:
-                parsed = await self._call_gemini_json(LANG_DETECT_SYSTEM_PROMPT, payload)
-                labels = parsed.get("labels", {})
-                if isinstance(labels, dict):
-                    for idx, txt in enumerate(sample):
-                        val = str(labels.get(str(idx), "")).strip().lower()
-                        if val in ("vi", "en", "ko", "neutral"):
-                            gemini_labels[txt] = val
-            except Exception as exc:
-                logger.debug("Gemini unknown-segment disambiguation skipped (%s).", type(exc).__name__)
-
+    def classify_texts(self, texts: list[str]) -> list[str]:
+        """Classifies texts locally using character and stopword heuristics."""
         resolved: list[str] = []
-        for t, lang in zip(texts, raw_langs):
+        for t in texts:
             if not (t or "").strip():
                 resolved.append("_empty")
-            elif lang == "unknown":
-                s = t.strip()
-                if s in gemini_labels:
-                    resolved.append(gemini_labels[s])
-                else:
-                    resolved.append(resolve_heuristic_fallback(t, lang))
             else:
-                resolved.append(lang)
+                lang = detect_segment_lang_heuristic(t)
+                resolved.append(resolve_heuristic_fallback(t, lang))
         return resolved
 
     async def inspect_document_languages(
         self,
         file_bytes: bytes,
         extension: str,
-        allow_gemini: bool = False,
     ) -> DocumentLangSummary:
         """Detects whether a .docx or .xlsx contract is bilingual (VI + EN) vs VI-only."""
         ext = extension.lower()
@@ -456,7 +312,7 @@ class EnCheckerService:
         if ext == ".docx":
             doc = docx.Document(io.BytesIO(file_bytes))
             para_texts = [p.text for p in doc.paragraphs]
-            para_langs = await self.classify_texts(para_texts, allow_gemini=allow_gemini)
+            para_langs = self.classify_texts(para_texts)
             vi_count += sum(1 for l in para_langs if l == "vi")
             en_count += sum(1 for l in para_langs if l == "en")
 
@@ -490,10 +346,7 @@ class EnCheckerService:
                             if id(cell._tc) in seen_tc:
                                 continue
                             seen_tc.add(id(cell._tc))
-                            c_langs = await self.classify_texts(
-                                [p.text for p in cell.paragraphs],
-                                allow_gemini=False,
-                            )
+                            c_langs = self.classify_texts([p.text for p in cell.paragraphs])
                             vi_count += sum(1 for l in c_langs if l == "vi")
                             en_count += sum(1 for l in c_langs if l == "en")
                             for vi_idxs, en_idxs in pair_paragraph_blocks(c_langs):
@@ -552,90 +405,6 @@ class EnCheckerService:
             paired_vi_en_count=paired_count,
             unmatched_vi_count=unmatched_vi,
             bilingual_tables_count=bilingual_tables,
-        )
-
-    async def verify_and_fix_en_batch(self, items: list[EnCheckItem]) -> EnCheckBatchResult:
-        """Verifies existing EN against VI in batches (1 Gemini turn per batch).
-
-        Returns corrected_map={pair_id: final_en_text} and telemetry stats.
-        """
-        if not items:
-            return EnCheckBatchResult(
-                corrected_map={},
-                stats=EnCheckStats(enabled=False, status="not_applicable"),
-            )
-
-        corrected_map: dict[str, str] = {item.pair_id: item.en_text for item in items}
-        batches: list[list[EnCheckItem]] = []
-        current_batch: list[EnCheckItem] = []
-        current_chars = 0
-
-        for item in items:
-            item_chars = len(item.vi_text) + len(item.en_text)
-            if current_batch and (
-                len(current_batch) >= self._batch_size
-                or current_chars + item_chars > self._batch_max_chars
-            ):
-                batches.append(current_batch)
-                current_batch = []
-                current_chars = 0
-            current_batch.append(item)
-            current_chars += item_chars
-        if current_batch:
-            batches.append(current_batch)
-
-        gemini_calls = 0
-        corrected_count = 0
-        error_count = 0
-
-        for batch in batches:
-            payload = json.dumps(
-                {
-                    "pairs": [
-                        {"id": item.pair_id, "vi": item.vi_text, "en": item.en_text}
-                        for item in batch
-                    ]
-                },
-                ensure_ascii=False,
-            )
-            try:
-                parsed = await self._call_gemini_json(EN_CHECK_SYSTEM_PROMPT, payload)
-                gemini_calls += 1
-                results = parsed.get("results", [])
-                by_id = {str(r.get("id")): r for r in results if isinstance(r, dict) and r.get("id") is not None}
-                for item in batch:
-                    res = by_id.get(item.pair_id)
-                    if not res:
-                        continue
-                    is_acc = bool(res.get("is_accurate", True))
-                    corr = str(res.get("corrected_en") or "").strip()
-                    if not is_acc and corr:
-                        corrected_map[item.pair_id] = corr
-                        corrected_count += 1
-            except Exception as exc:
-                error_count += 1
-                logger.warning(
-                    "Gemini EN verification batch failed (%s); keeping original EN for batch.",
-                    type(exc).__name__,
-                )
-
-        if gemini_calls == 0 and error_count > 0:
-            status_str = "skipped_unavailable"
-        elif error_count > 0:
-            status_str = "partial_error"
-        else:
-            status_str = "ok"
-
-        return EnCheckBatchResult(
-            corrected_map=corrected_map,
-            stats=EnCheckStats(
-                enabled=True,
-                checked_count=len(items),
-                corrected_count=corrected_count,
-                gemini_calls=gemini_calls,
-                model=self._model,
-                status=status_str,
-            ),
         )
 
 
